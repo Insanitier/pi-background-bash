@@ -1,0 +1,15 @@
+{
+  "name": "pi-herdr-bash",
+  "version": "0.1.0",
+  "description": "Herdr-backed background Bash for Pi",
+  "keywords": ["pi-package", "pi", "herdr", "bash"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
