@@ -17,6 +17,8 @@ import { Type } from "typebox";
 const ROOT_DIR = join(tmpdir(), "pi-herdr-bash");
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_LINES = 200;
+const MAX_FOREGROUND_TIMEOUT_SECONDS = 60;
+
 
 type Task = {
   cwd: string;
@@ -42,11 +44,30 @@ const bashSchema = Type.Object({
     Type.Boolean({ description: "Run as a detached process and return immediately" }),
   ),
   timeout: Type.Optional(
-    Type.Number({ description: "Foreground timeout in seconds; unsupported for background commands" }),
+    Type.Number({
+      description: "Foreground only: 1–60 seconds; defaults to 60. Omit for background commands.",
+    }),
   ),
 });
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\"'\"'")}'`;
+function resolveTimeout(background: boolean | undefined, timeout: number | undefined): number | undefined {
+  if (background) {
+    if (timeout !== undefined) {
+      throw new Error(
+        "Background bash does not accept timeout. Remove timeout; use herdr_task kill if cancellation is needed.",
+      );
+    }
+    return undefined;
+  }
+  if (timeout === undefined) return MAX_FOREGROUND_TIMEOUT_SECONDS;
+  if (!Number.isFinite(timeout) || timeout <= 0 || timeout > MAX_FOREGROUND_TIMEOUT_SECONDS) {
+    throw new Error(
+      `Foreground bash timeout must be between 1 and ${MAX_FOREGROUND_TIMEOUT_SECONDS} seconds; use background: true for longer work.`,
+    );
+  }
+  return timeout;
+}
 
 const taskRoot = (sessionId: string): string =>
   join(ROOT_DIR, Buffer.from(sessionId).toString("base64url"));
@@ -202,23 +223,20 @@ export default function (pi: ExtensionAPI) {
     "Execute Bash. Set background: true to run as a detached process and receive one completion message with exit code and final log tail. Foreground output uses Pi's native Bash behavior. Background commands do not support timeout.",
     promptSnippet: "Execute Bash commands; run long commands with background: true",
     promptGuidelines: [
-      "Use bash with background: true for long commands; wait for its completion message instead of polling output.",
+      "Foreground commands time out after at most 60 seconds; use background: true for longer work.",
+      "Background commands must omit timeout; wait for completion or use herdr_task kill.",
     ],
     parameters: bashSchema,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const timeout = resolveTimeout(params.background, params.timeout);
       if (!params.background) {
         const nativeBash = createBashTool(ctx.cwd);
         return nativeBash.execute(
           toolCallId,
-          params.timeout === undefined || params.timeout <= 0
-            ? { command: params.command }
-            : { command: params.command, timeout: params.timeout },
+          { command: params.command, timeout },
           signal,
           onUpdate,
         );
-      }
-      if (params.timeout !== undefined && params.timeout > 0) {
-        throw new Error("Background bash does not support timeout; omit timeout and use herdr_task kill if needed.");
       }
 
       await recoverTasks(ctx);
@@ -320,4 +338,16 @@ export default function (pi: ExtensionAPI) {
 if (process.env.HERDR_BASH_SELF_TEST === "1") {
   const quoted = shellQuote("a'b");
   if (quoted !== "'a'\"'\"'b'") throw new Error("shellQuote self-check failed");
+  if (resolveTimeout(false, undefined) !== 60) throw new Error("foreground timeout default self-check failed");
+  for (const [background, timeout] of [
+    [false, 61],
+    [true, 0],
+  ] as const) {
+    try {
+      resolveTimeout(background, timeout);
+      throw new Error("timeout validation self-check failed");
+    } catch (error) {
+      if ((error as Error).message === "timeout validation self-check failed") throw error;
+    }
+  }
 }
