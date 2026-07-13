@@ -1,8 +1,8 @@
 {
-  "name": "pi-herdr-bash",
+  "name": "pi-background-bash",
   "version": "0.1.0",
-  "description": "Herdr-backed background Bash for Pi",
-  "keywords": ["pi-package", "pi", "herdr", "bash"],
+  "description": "Detached background Bash for Pi",
+  "keywords": ["pi-package", "pi", "background", "bash"],
   "license": "MIT",
   "pi": {
     "extensions": ["./extensions"]

@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const ROOT_DIR = join(tmpdir(), "pi-herdr-bash");
+const ROOT_DIR = join(tmpdir(), "pi-background-bash");
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_LINES = 200;
 const MAX_FOREGROUND_TIMEOUT_SECONDS = 60;
@@ -55,7 +55,7 @@ function resolveTimeout(background: boolean | undefined, timeout: number | undef
   if (background) {
     if (timeout !== undefined) {
       throw new Error(
-        "Background bash does not accept timeout. Remove timeout; use herdr_task kill if cancellation is needed.",
+        "Background bash does not accept timeout. Remove timeout; use background_task kill if cancellation is needed.",
       );
     }
     return undefined;
@@ -173,7 +173,7 @@ export default function (pi: ExtensionAPI) {
       await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
       pi.sendMessage(
         {
-          customType: "herdr-bash-completion",
+          customType: "background-bash-completion",
           content: completionText(task, exitCode, output),
           details: { exitCode, taskId: task.id },
           display: true,
@@ -224,7 +224,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Execute Bash commands; run long commands with background: true",
     promptGuidelines: [
       "Foreground commands time out after at most 60 seconds; use background: true for longer work.",
-      "Background commands must omit timeout; wait for completion or use herdr_task kill.",
+      "Background commands must omit timeout; wait for completion or use background_task kill.",
     ],
     parameters: bashSchema,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -287,12 +287,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "herdr_task",
-    label: "herdr_task",
+    name: "background_task",
+    label: "background_task",
     description: "List or stop detached background Bash tasks started in this Pi session. Does not expose task output.",
     promptSnippet: "List or stop detached background Bash tasks",
     promptGuidelines: [
-      "Use herdr_task only to list or stop a background Bash task; do not poll it for progress.",
+      "Use background_task only to list or stop a background Bash task; do not poll it for progress.",
     ],
     parameters: taskSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -335,7 +335,7 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
-if (process.env.HERDR_BASH_SELF_TEST === "1") {
+if (process.env.BACKGROUND_BASH_SELF_TEST === "1") {
   const quoted = shellQuote("a'b");
   if (quoted !== "'a'\"'\"'b'") throw new Error("shellQuote self-check failed");
   if (resolveTimeout(false, undefined) !== 60) throw new Error("foreground timeout default self-check failed");
