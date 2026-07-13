@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, type FSWatcher, watch as watchSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
@@ -21,7 +22,7 @@ type Task = {
   cwd: string;
   directory: string;
   id: string;
-  paneId: string;
+  pid: number;
   startedAt: number;
   watcher?: FSWatcher;
   reporting?: boolean;
@@ -29,9 +30,6 @@ type Task = {
 
 type TaskMetadata = Omit<Task, "watcher" | "reporting">;
 
-type HerdrResponse<T> = { result: T };
-
-type SplitResponse = HerdrResponse<{ pane: { pane_id: string } }>;
 
 const taskSchema = Type.Object({
   action: StringEnum(["list", "kill"] as const),
@@ -41,7 +39,7 @@ const taskSchema = Type.Object({
 const bashSchema = Type.Object({
   command: Type.String({ description: "Bash command to execute" }),
   background: Type.Optional(
-    Type.Boolean({ description: "Run in a Herdr pane and return immediately" }),
+    Type.Boolean({ description: "Run as a detached process and return immediately" }),
   ),
   timeout: Type.Optional(
     Type.Number({ description: "Foreground timeout in seconds; unsupported for background commands" }),
@@ -66,7 +64,7 @@ const taskMetadata = (task: Task): TaskMetadata => ({
   cwd: task.cwd,
   directory: task.directory,
   id: task.id,
-  paneId: task.paneId,
+  pid: task.pid,
   startedAt: task.startedAt,
 });
 
@@ -75,15 +73,7 @@ async function ensureDirectory(path: string): Promise<void> {
   await chmod(path, 0o700);
 }
 
-async function runHerdr(pi: ExtensionAPI, args: string[]): Promise<string> {
-  const result = await pi.exec("herdr", args);
-  if (result.code !== 0) {
-    throw new Error(`herdr ${args.join(" ")} failed: ${(result.stderr || result.stdout).trim()}`);
-  }
-  return result.stdout;
-}
-
-async function writeTaskFiles(taskDirectory: string, command: string, token: string): Promise<void> {
+async function writeTaskFiles(taskDirectory: string, command: string): Promise<void> {
   const commandPath = join(taskDirectory, "command.sh");
   const outputPath = join(taskDirectory, "output.log");
   const exitCodePath = join(taskDirectory, "exit-code");
@@ -99,11 +89,10 @@ async function writeTaskFiles(taskDirectory: string, command: string, token: str
 set +e
 /bin/bash ${shellQuote(commandPath)} >${shellQuote(outputPath)} 2>&1
 status=$?
-printf '%s\\n' "$status" >${shellQuote(exitCodeTemporaryPath)}
+printf '%s\n' "$status" >${shellQuote(exitCodeTemporaryPath)}
 mv ${shellQuote(exitCodeTemporaryPath)} ${shellQuote(exitCodePath)}
 : >${shellQuote(doneTemporaryPath)}
 mv ${shellQuote(doneTemporaryPath)} ${shellQuote(donePath)}
-printf '%s %s\\n' ${shellQuote(token)} "$status"
 exit "$status"
 `,
     { mode: 0o700 },
@@ -115,7 +104,9 @@ async function readTask(taskDirectory: string): Promise<Task | undefined> {
     const metadata = JSON.parse(await readFile(join(taskDirectory, "meta.json"), "utf8")) as TaskMetadata;
     if (
       typeof metadata.id !== "string" ||
-      typeof metadata.paneId !== "string" ||
+      typeof metadata.pid !== "number" ||
+      !Number.isSafeInteger(metadata.pid) ||
+      metadata.pid <= 0 ||
       typeof metadata.cwd !== "string" ||
       typeof metadata.startedAt !== "number" ||
       metadata.directory !== taskDirectory
@@ -168,11 +159,6 @@ export default function (pi: ExtensionAPI) {
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
-      try {
-        await runHerdr(pi, ["pane", "close", task.paneId]);
-      } catch {
-        // ponytail: completion is durable even if Herdr already closed task pane.
-      }
       tasks.delete(task.id);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
@@ -213,7 +199,7 @@ export default function (pi: ExtensionAPI) {
     name: "bash",
     label: "bash",
     description:
-      "Execute Bash. Set background: true to run in an unfocused Herdr pane and receive one completion message with exit code and final log tail. Foreground output uses Pi's native Bash behavior. Background commands do not support timeout.",
+    "Execute Bash. Set background: true to run as a detached process and receive one completion message with exit code and final log tail. Foreground output uses Pi's native Bash behavior. Background commands do not support timeout.",
     promptSnippet: "Execute Bash commands; run long commands with background: true",
     promptGuidelines: [
       "Use bash with background: true for long commands; wait for its completion message instead of polling output.",
@@ -234,41 +220,37 @@ export default function (pi: ExtensionAPI) {
       if (params.timeout !== undefined && params.timeout > 0) {
         throw new Error("Background bash does not support timeout; omit timeout and use herdr_task kill if needed.");
       }
-      if (process.env.HERDR_ENV !== "1") {
-        throw new Error("Background bash requires Pi to run inside a Herdr pane (HERDR_ENV=1).");
-      }
 
       await recoverTasks(ctx);
       const sessionId = ctx.sessionManager.getSessionId();
       const id = randomBytes(8).toString("hex");
       const directory = taskPath(sessionId, id);
-      const token = `__PI_HERDR_DONE_${id}__`;
       await ensureDirectory(directory);
-      await writeTaskFiles(directory, params.command, token);
+      await writeTaskFiles(directory, params.command);
 
       let task: Task | undefined;
       try {
-        const split = JSON.parse(
-          await runHerdr(pi, ["pane", "split", "--current", "--direction", "right", "--cwd", ctx.cwd, "--no-focus"]),
-        ) as SplitResponse;
-        const paneId = split.result?.pane?.pane_id;
-        if (typeof paneId !== "string") throw new Error("herdr pane split returned no pane ID");
-
-        task = { cwd: ctx.cwd, directory, id, paneId, startedAt: Date.now() };
+        const child = spawn(join(directory, "runner.sh"), [], {
+          cwd: ctx.cwd,
+          detached: true,
+          stdio: "ignore",
+        });
+        if (!child.pid) throw new Error("background process did not start");
+        child.unref();
+        task = { cwd: ctx.cwd, directory, id, pid: child.pid, startedAt: Date.now() };
         await writeFile(join(directory, "meta.json"), JSON.stringify(taskMetadata(task)), {
           mode: 0o600,
         });
         tasks.set(id, task);
         watchTask(task);
-        await runHerdr(pi, ["pane", "run", paneId, shellQuote(join(directory, "runner.sh"))]);
       } catch (error) {
         if (task) {
           stopWatching(task);
           tasks.delete(task.id);
           try {
-            await runHerdr(pi, ["pane", "close", task.paneId]);
+            process.kill(-task.pid, "SIGTERM");
           } catch {
-            // ponytail: launch cleanup is best-effort; Herdr may already have closed pane.
+            // ponytail: launch cleanup is best-effort; process may already have exited.
           }
         }
         throw error;
@@ -278,7 +260,7 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text" as const,
-            text: `Started background task ${id} in Herdr pane ${task.paneId}. Completion will be reported automatically.`,
+            text: `Started detached background task ${id} (pid ${task.pid}). Completion will be reported automatically.`,
           },
         ],
         details: undefined as BashToolDetails | undefined,
@@ -289,8 +271,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "herdr_task",
     label: "herdr_task",
-    description: "List or stop background Bash tasks started in this Pi session. Does not expose task output.",
-    promptSnippet: "List or stop Herdr background Bash tasks",
+    description: "List or stop detached background Bash tasks started in this Pi session. Does not expose task output.",
+    promptSnippet: "List or stop detached background Bash tasks",
     promptGuidelines: [
       "Use herdr_task only to list or stop a background Bash task; do not poll it for progress.",
     ],
@@ -302,7 +284,7 @@ export default function (pi: ExtensionAPI) {
           .filter((task) => taskStatus(task) === "running")
           .map((task) => {
             const seconds = Math.floor((Date.now() - task.startedAt) / 1000);
-            return `${task.id} ${taskStatus(task)} ${seconds}s pane=${task.paneId} cwd=${task.cwd}`;
+            return `${task.id} ${taskStatus(task)} ${seconds}s pid=${task.pid} cwd=${task.cwd}`;
           });
         return {
           content: [{ type: "text" as const, text: lines.length ? lines.join("\n") : "No background tasks." }],
@@ -321,8 +303,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       stopWatching(task);
+      try {
+        process.kill(-task.pid, "SIGTERM");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
       await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
-      await runHerdr(pi, ["pane", "close", task.paneId]);
       return {
         content: [{ type: "text" as const, text: `Stopped background task ${task.id}.` }],
         details: undefined,
