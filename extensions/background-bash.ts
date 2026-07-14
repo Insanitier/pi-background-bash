@@ -12,6 +12,7 @@ import {
   type ExtensionContext,
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
+import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const ROOT_DIR = join(tmpdir(), "pi-background-bash");
@@ -153,6 +154,10 @@ function completionText(task: Task, exitCode: number, output: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.registerMessageRenderer("background-bash-completion", (message) =>
+    new Text(message.content, 0, 0),
+  );
+
   const tasks = new Map<string, Task>();
 
   const stopWatching = (task: Task): void => {
@@ -336,7 +341,10 @@ export default function (pi: ExtensionAPI) {
 }
 
 if (process.env.BACKGROUND_BASH_SELF_TEST === "1") {
-  const quoted = shellQuote("a'b");
+  const lines = new Text("x".repeat(308), 0, 0).render(95);
+  if (lines.some((line) => visibleWidth(line) > 95)) {
+    throw new Error("completion renderer self-check failed");
+  }
   if (quoted !== "'a'\"'\"'b'") throw new Error("shellQuote self-check failed");
   if (resolveTimeout(false, undefined) !== 60) throw new Error("foreground timeout default self-check failed");
   for (const [background, timeout] of [
