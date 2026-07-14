@@ -122,6 +122,7 @@ exit "$status"
 }
 
 async function readTask(taskDirectory: string): Promise<Task | undefined> {
+  if (existsSync(join(taskDirectory, "reported"))) return undefined;
   try {
     const metadata = JSON.parse(await readFile(join(taskDirectory, "meta.json"), "utf8")) as TaskMetadata;
     if (
@@ -341,6 +342,7 @@ export default function (pi: ExtensionAPI) {
 }
 
 if (process.env.BACKGROUND_BASH_SELF_TEST === "1") {
+  const quoted = shellQuote("a'b");
   const lines = new Text("x".repeat(308), 0, 0).render(95);
   if (lines.some((line) => visibleWidth(line) > 95)) {
     throw new Error("completion renderer self-check failed");
