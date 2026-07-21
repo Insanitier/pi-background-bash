@@ -1,94 +1,63 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, type FSWatcher, watch as watchSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { openSync, closeSync, fstatSync, readSync, unlinkSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  type BashToolDetails,
-  createBashTool,
   type ExtensionAPI,
-  type ExtensionContext,
+  type ExtensionUIContext,
   truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+// ── Constants ──────────────────────────────────────────────────────────────
 const ROOT_DIR = join(tmpdir(), "pi-background-bash");
+const LOG_DIR = "/tmp/pi-bg";
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_LINES = 200;
-const MAX_FOREGROUND_TIMEOUT_SECONDS = 60;
+const AUTO_BG_TIMEOUT_MS = 120_000;
+const QUICK_COMPLETION_MS = 2_000;
+const FOREGROUND_TAIL_BYTES = 4_096;
+const PREVIEW_CHARS = 40;
 
-
+// ── Types ──────────────────────────────────────────────────────────────────
 type Task = {
-  cwd: string;
-  directory: string;
   id: string;
+  command: string;
   pid: number;
   startedAt: number;
+  cwd: string;
+  // File-based task fields (explicit background via runner.sh)
+  directory?: string;
   watcher?: FSWatcher;
   reporting?: boolean;
+  // Direct spawn fields (auto-backgrounded)
+  proc?: ChildProcess;
+  logPath?: string;
+  exit?: Promise<number | null>;
+  done?: boolean; // marked when completed, kept for output retrieval
 };
 
-type TaskMetadata = Omit<Task, "watcher" | "reporting">;
-
-
-const taskSchema = Type.Object({
-  action: StringEnum(["list", "kill"] as const),
-  taskId: Type.Optional(Type.String({ description: "Task ID required by kill" })),
-});
-
-const bashSchema = Type.Object({
-  command: Type.String({ description: "Bash command to execute" }),
-  background: Type.Optional(
-    Type.Boolean({ description: "Run as a detached process and return immediately" }),
-  ),
-  timeout: Type.Optional(
-    Type.Number({
-      description: "Foreground only: 1–60 seconds; defaults to 60. Omit for background commands.",
-    }),
-  ),
-});
-
+// ── File helpers (explicit background via runner.sh) ───────────────────────
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\"'\"'")}'`;
-function resolveTimeout(background: boolean | undefined, timeout: number | undefined): number | undefined {
-  if (background) {
-    if (timeout !== undefined) {
-      throw new Error(
-        "Background bash does not accept timeout. Remove timeout; use background_task kill if cancellation is needed.",
-      );
-    }
-    return undefined;
-  }
-  if (timeout === undefined) return MAX_FOREGROUND_TIMEOUT_SECONDS;
-  if (!Number.isFinite(timeout) || timeout <= 0 || timeout > MAX_FOREGROUND_TIMEOUT_SECONDS) {
-    throw new Error(
-      `Foreground bash timeout must be between 1 and ${MAX_FOREGROUND_TIMEOUT_SECONDS} seconds; use background: true for longer work.`,
-    );
-  }
-  return timeout;
-}
 
 const taskRoot = (sessionId: string): string =>
   join(ROOT_DIR, Buffer.from(sessionId).toString("base64url"));
 
 const taskPath = (sessionId: string, taskId: string): string => join(taskRoot(sessionId), taskId);
 
-const taskStatus = (task: Task): "cancelled" | "finished" | "running" => {
-  if (existsSync(join(task.directory, "cancelled"))) return "cancelled";
-  return existsSync(join(task.directory, "done")) ? "finished" : "running";
+const fileTaskOutput = (task: Task): string => join(task.directory!, "output.log");
+
+const isFileTaskDone = (task: Task): boolean => {
+  if (!task.directory) return false;
+  if (existsSync(join(task.directory, "reported"))) return true;
+  if (existsSync(join(task.directory, "cancelled"))) return true;
+  return existsSync(join(task.directory, "done"));
 };
-
-const taskOutput = (task: Task): string => join(task.directory, "output.log");
-
-const taskMetadata = (task: Task): TaskMetadata => ({
-  cwd: task.cwd,
-  directory: task.directory,
-  id: task.id,
-  pid: task.pid,
-  startedAt: task.startedAt,
-});
 
 async function ensureDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
@@ -121,39 +90,151 @@ exit "$status"
   );
 }
 
-async function readTask(taskDirectory: string): Promise<Task | undefined> {
-  if (existsSync(join(taskDirectory, "reported"))) return undefined;
+// ── Direct spawn helper ────────────────────────────────────────────────────
+function spawnWithFileOutput(command: string, cwd: string, logPath: string): {
+  proc: ChildProcess;
+  pid: number;
+  exit: Promise<number | null>;
+} {
+  mkdirSync(dirname(logPath), { recursive: true });
+  const fd = openSync(logPath, "w");
+  let proc: ChildProcess;
   try {
-    const metadata = JSON.parse(await readFile(join(taskDirectory, "meta.json"), "utf8")) as TaskMetadata;
-    if (
-      typeof metadata.id !== "string" ||
-      typeof metadata.pid !== "number" ||
-      !Number.isSafeInteger(metadata.pid) ||
-      metadata.pid <= 0 ||
-      typeof metadata.cwd !== "string" ||
-      typeof metadata.startedAt !== "number" ||
-      metadata.directory !== taskDirectory
-    ) {
-      return undefined;
-    }
-    return metadata;
+    proc = spawn("bash", ["-c", command], {
+      stdio: ["ignore", fd, fd],
+      cwd,
+      detached: true,
+      env: { ...process.env },
+    });
+  } finally {
+    closeSync(fd);
+  }
+
+  if (!proc.pid) {
+    try { unlinkSync(logPath); } catch { /* ok */ }
+    throw new Error("Failed to spawn process");
+  }
+
+  const exit = new Promise<number | null>((resolve) => {
+    proc.on("close", (code) => resolve(code));
+    proc.on("error", () => resolve(1));
+  });
+
+  return { proc, pid: proc.pid, exit };
+}
+
+// ── Output reading ─────────────────────────────────────────────────────────
+function readTail(logPath: string, maxChars: number): string {
+  let fd: number;
+  try {
+    fd = openSync(logPath, "r");
   } catch {
-    return undefined;
+    return "(no output yet)";
+  }
+  try {
+    const { size } = fstatSync(fd);
+    if (size === 0) return "(no output yet)";
+    const toRead = Math.min(size, maxChars);
+    const buf = Buffer.alloc(toRead);
+    readSync(fd, buf, 0, toRead, Math.max(0, size - toRead));
+    const body = buf.toString("utf-8");
+    return size > maxChars
+      ? `...[truncated, showing last ${maxChars} chars]\n${body}`
+      : body;
+  } catch {
+    return "(no output yet)";
+  } finally {
+    closeSync(fd);
   }
 }
 
-function completionText(task: Task, exitCode: number, output: string): string {
-  const result = truncateTail(output, { maxBytes: MAX_OUTPUT_BYTES, maxLines: MAX_OUTPUT_LINES });
-  const title = exitCode === 0 ? "Background bash finished" : "Background bash failed";
-  const header = `${title}: ${task.id} (exit ${exitCode})\nFull output: ${taskOutput(task)}`;
-  if (!result.content) return header;
-
-  const truncation = result.truncated
-    ? `\n\n[Output truncated. Full output: ${taskOutput(task)}]`
-    : "";
-  return `${header}\n\n\`\`\`\n${result.content}\n\`\`\`${truncation}`;
+// ── Formatting ──────────────────────────────────────────────────────────────
+function formatDuration(ms: number): string {
+  const totalSecs = Math.floor(ms / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  return mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
 }
 
+function makeCompletionText(task: Task, exitCode: number, output: string): string {
+  const dur = formatDuration(Date.now() - task.startedAt);
+  const label = task.command.length > 60 ? task.command.slice(0, 57) + "..." : task.command;
+  // unnamed task → quoted command like patty: "command"
+  const display = `"${label}"`;
+
+  if (exitCode === 0) {
+    return `✓ ${display} (${dur}, ${task.id})`;
+  }
+
+  // Failure: include output tail
+  const result = truncateTail(output, { maxBytes: MAX_OUTPUT_BYTES, maxLines: MAX_OUTPUT_LINES });
+  const header = `✗ ${display} (${dur}, ${task.id}, exit ${exitCode})`;
+  if (!result.content) return header;
+  return `${header}\n\n\`\`\`\n${result.content}\n\`\`\``;
+}
+
+// ── Status bar ──────────────────────────────────────────────────────────────
+let sidebarLastKey: string | undefined;
+let sidebarTicker: NodeJS.Timeout | undefined;
+
+function renderSidebar(tasks: Map<string, Task>, ui: ExtensionUIContext): void {
+  const running: Task[] = [];
+  let doneCount = 0;
+  for (const task of tasks.values()) {
+    if (task.directory) {
+      if (isFileTaskDone(task)) doneCount++;
+      else running.push(task);
+    } else if (task.done) {
+      doneCount++;
+    } else {
+      running.push(task);
+    }
+  }
+
+  if (running.length === 0 && doneCount === 0) {
+    if (sidebarTicker) {
+      clearInterval(sidebarTicker);
+      sidebarTicker = undefined;
+    }
+    if (sidebarLastKey !== undefined) {
+      sidebarLastKey = undefined;
+      ui.setWidget("background-tasks", undefined);
+      ui.setStatus("background-tasks", undefined);
+    }
+    return;
+  }
+
+  const pills: string[] = [];
+  for (const t of running) {
+    const dur = formatDuration(Date.now() - t.startedAt);
+    pills.push(`▶ ${t.id.slice(-6)}: ${t.command.slice(0, PREVIEW_CHARS)} (${dur})`);
+  }
+
+  const parts: string[] = [];
+  if (running.length > 0) parts.push(`${running.length} running`);
+  if (doneCount > 0) parts.push(`${doneCount} done`);
+  const statusText = `▶ ${parts.join(", ")}`;
+  const key = `${pills.join("\n")}|${statusText}`;
+  if (key !== sidebarLastKey) {
+    sidebarLastKey = key;
+    ui.setWidget("background-tasks", pills);
+    ui.setStatus("background-tasks", statusText);
+  }
+
+  if (!sidebarTicker) {
+    sidebarTicker = setInterval(() => renderSidebar(tasks, ui), 1000);
+    sidebarTicker.unref();
+  }
+}
+
+function stopSidebarTicker(): void {
+  if (sidebarTicker) {
+    clearInterval(sidebarTicker);
+    sidebarTicker = undefined;
+  }
+}
+
+// ── Extension entry ──────────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("background-bash-completion", (message) =>
     new Text(message.content, 0, 0),
@@ -161,155 +242,315 @@ export default function (pi: ExtensionAPI) {
 
   const tasks = new Map<string, Task>();
 
+  // ── File-based task lifecycle ────────────────────────────────────────────
   const stopWatching = (task: Task): void => {
     task.watcher?.close();
     task.watcher = undefined;
   };
 
-  const completeTask = async (task: Task): Promise<void> => {
-    if (task.reporting || taskStatus(task) !== "finished") return;
+  const completeFileTask = async (task: Task, ui: ExtensionUIContext): Promise<void> => {
+    if (task.reporting || !task.directory) return;
+    const done = existsSync(join(task.directory, "done"));
+    const cancelled = existsSync(join(task.directory, "cancelled"));
+    if (!done && !cancelled) return;
+
+    if (cancelled) {
+      task.reporting = true;
+      stopWatching(task);
+      renderSidebar(tasks, ui);
+      return;
+    }
+
     task.reporting = true;
     stopWatching(task);
 
     try {
       const exitCode = Number.parseInt(await readFile(join(task.directory, "exit-code"), "utf8"), 10);
-      const output = await readFile(taskOutput(task), "utf8");
+      const output = await readFile(fileTaskOutput(task), "utf8");
       if (!Number.isInteger(exitCode)) throw new Error("invalid exit code");
 
       await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
       pi.sendMessage(
         {
           customType: "background-bash-completion",
-          content: completionText(task, exitCode, output),
+          content: makeCompletionText(task, exitCode, output),
           details: { exitCode, taskId: task.id },
           display: true,
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
-      tasks.delete(task.id);
+      renderSidebar(tasks, ui);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
       task.reporting = false;
     }
   };
 
-  const watchTask = (task: Task): void => {
-    if (taskStatus(task) !== "running" || task.watcher) return;
-    task.watcher = watchSync(task.directory, () => void completeTask(task));
-    void completeTask(task);
+  const watchFileTask = (task: Task, ui: ExtensionUIContext): void => {
+    if (!task.directory || task.watcher) return;
+    task.watcher = watchSync(task.directory, () => void completeFileTask(task, ui));
+    void completeFileTask(task, ui);
   };
 
-  const recoverTasks = async (ctx: ExtensionContext): Promise<void> => {
-    const root = taskRoot(ctx.sessionManager.getSessionId());
+  // ── Direct task completion ───────────────────────────────────────────────
+  const completeDirectTask = (task: Task, code: number | null, ui: ExtensionUIContext): void => {
+    const logPath = task.logPath!;
+    let output = "(no output)";
+    try {
+      output = readTail(logPath, MAX_OUTPUT_BYTES);
+    } catch { /* best-effort */ }
+
+    pi.sendMessage(
+      {
+        customType: "background-bash-completion",
+        content: makeCompletionText(task, code ?? 1, output),
+        details: { exitCode: code, taskId: task.id },
+        display: true,
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+    task.done = true;
+    renderSidebar(tasks, ui);
+  };
+
+  // ── Session recovery ─────────────────────────────────────────────────────
+  const recoverFileTasks = async (ui: ExtensionUIContext, sessionManager: { getSessionId: () => string }): Promise<void> => {
+    const root = taskRoot(sessionManager.getSessionId());
     if (!existsSync(root)) return;
 
     for (const entry of await readdir(root, { withFileTypes: true })) {
       if (!entry.isDirectory() || tasks.has(entry.name)) continue;
-      const task = await readTask(join(root, entry.name));
-      if (!task) continue;
-      tasks.set(task.id, task);
-      if (taskStatus(task) === "finished") void completeTask(task);
-      else watchTask(task);
+      const taskDir = join(root, entry.name);
+      if (existsSync(join(taskDir, "reported"))) continue;
+      try {
+        const metaRaw = await readFile(join(taskDir, "meta.json"), "utf8");
+        const meta = JSON.parse(metaRaw) as { id: string; pid: number; cwd: string; startedAt: number };
+        const task: Task = {
+          id: meta.id,
+          pid: meta.pid,
+          command: "",
+          cwd: meta.cwd,
+          startedAt: meta.startedAt,
+          directory: taskDir,
+        };
+        try {
+          task.command = (await readFile(join(taskDir, "command.sh"), "utf8")).trim();
+        } catch { /* best-effort */ }
+        tasks.set(task.id, task);
+        if (!isFileTaskDone(task)) watchFileTask(task, ui);
+        else void completeFileTask(task, ui);
+      } catch { /* skip corrupt entry */ }
     }
   };
 
-  pi.on("session_start", async (_event, ctx) => {
-    await recoverTasks(ctx);
+  // ── Foreground execution with auto-background ────────────────────────────
+  const runForeground = async (
+    command: string,
+    ui: ExtensionUIContext,
+    cwd: string,
+    onUpdate?: (update: { content: { type: "text"; text: string }[]; details: undefined }) => void,
+  ): Promise<{ content: { type: "text"; text: string }[]; details?: undefined }> => {
+    const id = `bg-${randomBytes(4).toString("hex")}`;
+    const logPath = join(LOG_DIR, `${id}.log`);
+
+    const { proc, pid, exit } = spawnWithFileOutput(command, cwd, logPath);
+
+    const task: Task = { id, command, pid, startedAt: Date.now(), cwd, proc, logPath, exit };
+    tasks.set(id, task);
+    renderSidebar(tasks, ui);
+
+    // Quick completion window (2s)
+    const quickResult = await Promise.race([
+      exit.then((code) => ({ source: "exit" as const, code })),
+      new Promise<{ source: "timeout" }>((r) => {
+        const t = setTimeout(() => r({ source: "timeout" }), QUICK_COMPLETION_MS);
+        t.unref();
+      }),
+    ]);
+
+    if (quickResult.source === "exit") {
+      tasks.delete(id);
+      renderSidebar(tasks, ui);
+      const output = readTail(logPath, FOREGROUND_TAIL_BYTES);
+      try { unlinkSync(logPath); } catch { /* ok */ }
+      if (quickResult.code !== 0 && quickResult.code !== null) {
+        throw new Error(output || `Command exited with code ${quickResult.code}`);
+      }
+      return { content: [{ type: "text", text: output || "(no output)" }], details: undefined };
+    }
+
+    // Still running — poll progress
+    let pollTimer: NodeJS.Timeout | undefined;
+    let lastPollSize = 0;
+    const startPolling = () => {
+      pollTimer = setInterval(() => {
+        try {
+          const fd = openSync(logPath, "r");
+          const { size } = fstatSync(fd);
+          closeSync(fd);
+          if (size === lastPollSize) return;
+          lastPollSize = size;
+          const tail = readTail(logPath, FOREGROUND_TAIL_BYTES);
+          onUpdate?.({ content: [{ type: "text", text: tail }], details: undefined });
+        } catch { /* file not ready */ }
+      }, 1000);
+      pollTimer.unref();
+    };
+    startPolling();
+
+    // Race: completion vs auto-background timeout
+    const raceResult = await Promise.race([
+      exit.then((code) => ({ source: "exit" as const, code })),
+      new Promise<{ source: "timeout" }>((r) => {
+        const t = setTimeout(() => r({ source: "timeout" }), AUTO_BG_TIMEOUT_MS);
+        t.unref();
+      }),
+    ]);
+
+    if (pollTimer) clearInterval(pollTimer);
+
+    if (raceResult.source === "exit") {
+      tasks.delete(id);
+      renderSidebar(tasks, ui);
+      const output = readTail(logPath, FOREGROUND_TAIL_BYTES);
+      try { unlinkSync(logPath); } catch { /* ok */ }
+      if (raceResult.code !== 0 && raceResult.code !== null) {
+        throw new Error(output || `Command exited with code ${raceResult.code}`);
+      }
+      return { content: [{ type: "text", text: output || "(no output)" }], details: undefined };
+    }
+
+    // Auto-background: detach process, notify on completion
+    proc.unref();
+    exit.then((code) => completeDirectTask(task, code, ui));
+
+    return {
+      content: [{
+        type: "text",
+        text: `Auto-backgrounded as ${id} (pid ${pid}). Will notify on completion.\nCommand: ${command}\nOutput: ${logPath}`,
+      }],
+      details: undefined,
+    };
+  };
+
+  // ── Schema ───────────────────────────────────────────────────────────────
+  const bashParamSchema = Type.Object({
+    command: Type.String({ description: "Bash command to execute" }),
+    timeout: Type.Optional(Type.Number({
+      description: "Foreground timeout in seconds before auto-background (default: 120)",
+    })),
+    run_in_background: Type.Optional(Type.Boolean({
+      description: "Start in background immediately (fire-and-forget)",
+    })),
+    description: Type.Optional(Type.String({
+      description: "Optional human-readable label for the task",
+    })),
   });
 
-  pi.on("session_shutdown", () => {
-    for (const task of tasks.values()) stopWatching(task);
-    tasks.clear();
+  const taskSchema = Type.Object({
+    action: StringEnum(["list", "kill"] as const),
+    taskId: Type.Optional(Type.String({ description: "Task ID required by kill" })),
   });
 
+  // ── Register tools ───────────────────────────────────────────────────────
+
+  // bash — override with auto-background
   pi.registerTool({
     name: "bash",
     label: "bash",
     description:
-    "Execute Bash. Set background: true to run as a detached process and receive one completion message with exit code and final log tail. Foreground output uses Pi's native Bash behavior. Background commands do not support timeout.",
-    promptSnippet: "Execute Bash commands; run long commands with background: true",
+      "Run a bash command. Long-running foreground commands auto-background after timeout (default 120s). " +
+      "Set run_in_background=true to start in background immediately. " +
+      "Use background_task to list or kill running tasks.",
+    promptSnippet: "Run shell commands; long-running commands auto-background or use run_in_background=true",
     promptGuidelines: [
-      "Foreground commands time out after at most 60 seconds; use background: true for longer work.",
-      "Background commands must omit timeout; wait for completion or use background_task kill.",
+      "Foreground commands auto-background after timeout instead of failing.",
+      "Use run_in_background=true for commands expected to run long.",
+      "Never `sleep N` to wait for something — use jobs attach or an until loop.",
+      "Use background_task to list or kill running tasks.",
     ],
-    parameters: bashSchema,
+    parameters: bashParamSchema,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const timeout = resolveTimeout(params.background, params.timeout);
-      if (!params.background) {
-        const nativeBash = createBashTool(ctx.cwd);
-        return nativeBash.execute(
-          toolCallId,
-          { command: params.command, timeout },
-          signal,
-          onUpdate,
-        );
-      }
+      const p = params as { command: string; timeout?: number; run_in_background?: boolean; description?: string };
+      const ui = ctx.ui;
 
-      await recoverTasks(ctx);
-      const sessionId = ctx.sessionManager.getSessionId();
-      const id = randomBytes(8).toString("hex");
-      const directory = taskPath(sessionId, id);
-      await ensureDirectory(directory);
-      await writeTaskFiles(directory, params.command);
+      if (p.run_in_background) {
+        // Explicit background — use runner.sh (file-based)
+        const sessionId = ctx.sessionManager.getSessionId();
+        const id = randomBytes(8).toString("hex");
+        const directory = taskPath(sessionId, id);
+        await ensureDirectory(directory);
+        await writeTaskFiles(directory, p.command);
 
-      let task: Task | undefined;
-      try {
-        const child = spawn(join(directory, "runner.sh"), [], {
-          cwd: ctx.cwd,
-          detached: true,
-          stdio: "ignore",
-        });
-        if (!child.pid) throw new Error("background process did not start");
-        child.unref();
-        task = { cwd: ctx.cwd, directory, id, pid: child.pid, startedAt: Date.now() };
-        await writeFile(join(directory, "meta.json"), JSON.stringify(taskMetadata(task)), {
-          mode: 0o600,
-        });
-        tasks.set(id, task);
-        watchTask(task);
-      } catch (error) {
-        if (task) {
-          stopWatching(task);
-          tasks.delete(task.id);
-          try {
-            process.kill(-task.pid, "SIGTERM");
-          } catch {
-            // ponytail: launch cleanup is best-effort; process may already have exited.
+        let task: Task | undefined;
+        try {
+          const child = spawn(join(directory, "runner.sh"), [], {
+            cwd: ctx.cwd,
+            detached: true,
+            stdio: "ignore",
+          });
+          if (!child.pid) throw new Error("background process did not start");
+          child.unref();
+          task = { id, pid: child.pid, command: p.command, cwd: ctx.cwd, startedAt: Date.now(), directory };
+          await writeFile(join(directory, "meta.json"), JSON.stringify({
+            id, pid: child.pid, cwd: ctx.cwd, startedAt: task.startedAt,
+          }), { mode: 0o600 });
+          tasks.set(id, task);
+          watchFileTask(task, ui);
+          renderSidebar(tasks, ui);
+        } catch (error) {
+          if (task) {
+            stopWatching(task);
+            tasks.delete(task.id);
+            try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
           }
+          throw error;
         }
-        throw error;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Started detached background task ${id} (pid ${task?.pid}). Completion will be reported automatically.`,
+          }],
+          details: undefined,
+        };
       }
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Started detached background task ${id} (pid ${task.pid}). Completion will be reported automatically.`,
-          },
-        ],
-        details: undefined as BashToolDetails | undefined,
-      };
+      // Foreground with auto-background
+      return runForeground(p.command, ui, ctx.cwd, onUpdate);
     },
   });
 
+  // background_task — list / kill
   pi.registerTool({
     name: "background_task",
     label: "background_task",
-    description: "List or stop detached background Bash tasks started in this Pi session. Does not expose task output.",
-    promptSnippet: "List or stop detached background Bash tasks",
+    description: "List or stop background tasks. Shows both file-based and auto-backgrounded tasks.",
+    promptSnippet: "List or stop background tasks",
     promptGuidelines: [
-      "Use background_task only to list or stop a background Bash task; do not poll it for progress.",
+      "Use background_task to list or kill a background task.",
+      "Background tasks auto-notify on completion with a short status line.",
     ],
     parameters: taskSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      await recoverTasks(ctx);
+      const ui = ctx.ui;
+
       if (params.action === "list") {
-        const lines = [...tasks.values()]
-          .filter((task) => taskStatus(task) === "running")
-          .map((task) => {
-            const seconds = Math.floor((Date.now() - task.startedAt) / 1000);
-            return `${task.id} ${taskStatus(task)} ${seconds}s pid=${task.pid} cwd=${task.cwd}`;
-          });
+        const lines: string[] = [];
+        for (const task of tasks.values()) {
+          const seconds = Math.floor((Date.now() - task.startedAt) / 1000);
+          const kind = task.directory ? "bg" : "auto";
+          let status: string;
+          if (task.directory) {
+            if (isFileTaskDone(task)) status = "done";
+            else status = "running";
+          } else {
+            status = task.done ? "done" : "running";
+          }
+          if (status === "running") lines.push(`${task.id} ${kind} ${seconds}s`);
+          else lines.push(`${task.id} ${kind} ${seconds}s [${status}]`);
+        }
+        renderSidebar(tasks, ui); // refresh sidebar in case it's stale
         return {
           content: [{ type: "text" as const, text: lines.length ? lines.join("\n") : "No background tasks." }],
           details: { tasks: lines.length },
@@ -319,45 +560,176 @@ export default function (pi: ExtensionAPI) {
       if (!params.taskId) throw new Error("taskId is required for kill.");
       const task = tasks.get(params.taskId);
       if (!task) throw new Error(`Unknown background task: ${params.taskId}`);
-      if (taskStatus(task) !== "running") {
-        return {
-          content: [{ type: "text" as const, text: `Task ${task.id} is already ${taskStatus(task)}.` }],
-          details: undefined,
-        };
-      }
 
-      stopWatching(task);
-      try {
-        process.kill(-task.pid, "SIGTERM");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      if (task.directory) {
+        const done = existsSync(join(task.directory, "done"));
+        const cancelled = existsSync(join(task.directory, "cancelled"));
+        if (done || cancelled) {
+          return {
+            content: [{ type: "text" as const, text: `Task ${task.id} is already finished.` }],
+            details: undefined,
+          };
+        }
+        stopWatching(task);
+        try { process.kill(-task.pid, "SIGTERM"); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+        await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
+      } else {
+        try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
+        try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
+        tasks.delete(task.id);
       }
-      await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
+      renderSidebar(tasks, ui);
       return {
         content: [{ type: "text" as const, text: `Stopped background task ${task.id}.` }],
         details: undefined,
       };
     },
   });
+
+  // ── /bg command — interactive task manager ────────────────────────────────
+  pi.registerCommand("bg", {
+    description: "Open the interactive background task manager",
+    handler: async (_args, ctx) => {
+      const ui = ctx.ui as ExtensionUIContext;
+
+      while (true) {
+        const running = [...tasks.values()].filter(t => {
+          if (t.directory) return !isFileTaskDone(t);
+          return !t.done;
+        }).sort((a, b) => b.startedAt - a.startedAt);
+        const terminal = [...tasks.values()].filter(t => {
+          if (t.directory) return isFileTaskDone(t);
+          return t.done;
+        }).sort((a, b) => b.startedAt - a.startedAt);
+        const all = [...running, ...terminal];
+
+        if (all.length === 0) {
+          ui.notify("No background tasks", "info");
+          return;
+        }
+
+        const items = all.map(t => {
+          const isTerminal = t.done || (t.directory && isFileTaskDone(t));
+          const icon = isTerminal ? "✓" : "▶";
+          const cmd = t.command.length > 40 ? t.command.slice(0, 37) + "..." : t.command;
+          const status = isTerminal ? "done" : `running (${formatDuration(Date.now() - t.startedAt)})`;
+          return `${icon} ${t.id.slice(-8)}: ${cmd} · ${status}`;
+        });
+
+        const choice = await ui.select("Background Tasks", items);
+        if (choice === undefined) return;
+
+        const idx = items.indexOf(choice);
+        const task = all[idx];
+        if (!task) return;
+
+        // Show actions for selected task
+        const label = task.id.slice(-8);
+        const isRunning = task.directory ? !isFileTaskDone(task) : !task.done;
+
+        const actions = isRunning
+          ? ["Show Output", "Kill", "← Back"]
+          : ["Show Output", "Remove", "← Back"];
+
+        const cmdTitle = task.command.length > 40 ? task.command.slice(0, 37) + "..." : task.command;
+        const action = await ui.select(`▶ ${label}: ${cmdTitle}`, actions);
+        if (action === undefined) return;
+
+        if (action === "← Back") continue;
+
+        if (action === "Show Output") {
+          let output = "(no output)";
+          try {
+            if (task.directory) {
+              const p = fileTaskOutput(task);
+              output = await readFile(p, "utf8") || "(empty)";
+            } else if (task.logPath) {
+              output = await readFile(task.logPath, "utf8") || "(empty)";
+            }
+          } catch { /* best-effort */ }
+          const dur = formatDuration(Date.now() - task.startedAt);
+          const meta = `Command: ${task.command}\nPID: ${task.pid} · Duration: ${dur}\nLog: ${task.logPath || task.directory}`;
+          await ui.editor(`Output: ${label}`, `${meta}\n\n--- OUTPUT ---\n${output}`);
+          continue;
+        }
+
+        if (action === "Kill") {
+          if (task.directory) {
+            stopWatching(task);
+            try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
+            await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
+          } else {
+            try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
+            try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
+            tasks.delete(task.id);
+          }
+          renderSidebar(tasks, ui);
+          const cmdLabel = task.command.length > 60 ? task.command.slice(0, 57) + "..." : task.command;
+          pi.sendMessage(
+            {
+              customType: "background-bash-completion",
+              content: `⊘ ${cmdLabel} (${task.id}) — killed by user`,
+              details: { taskId: task.id },
+              display: true,
+            },
+            { deliverAs: "followUp", triggerTurn: true },
+          );
+          continue;
+        }
+
+        if (action === "Remove") {
+          stopWatching(task);
+          try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
+          tasks.delete(task.id);
+          renderSidebar(tasks, ui);
+          ui.notify(`Removed ${label}`, "info");
+          continue;
+        }
+      }
+    },
+  });
+
+  // ── Event hooks ───────────────────────────────────────────────────────────
+  pi.on("session_start", async (_event, ctx) => {
+    await recoverFileTasks(ctx.ui, ctx.sessionManager);
+    renderSidebar(tasks, ctx.ui);
+  });
+
+  pi.on("session_shutdown", () => {
+    stopSidebarTicker();
+    for (const task of tasks.values()) {
+      stopWatching(task);
+      if (task.proc && !task.directory) {
+        try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
+      }
+    }
+    tasks.clear();
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
+    renderSidebar(tasks, ctx.ui);
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    renderSidebar(tasks, ctx.ui);
+  });
 }
 
+// ── Self-tests ──────────────────────────────────────────────────────────────
 if (process.env.BACKGROUND_BASH_SELF_TEST === "1") {
   const quoted = shellQuote("a'b");
+  if (quoted !== "'a'\"'\"'b'") throw new Error("shellQuote self-check failed");
+
   const lines = new Text("x".repeat(308), 0, 0).render(95);
   if (lines.some((line) => visibleWidth(line) > 95)) {
     throw new Error("completion renderer self-check failed");
   }
-  if (quoted !== "'a'\"'\"'b'") throw new Error("shellQuote self-check failed");
-  if (resolveTimeout(false, undefined) !== 60) throw new Error("foreground timeout default self-check failed");
-  for (const [background, timeout] of [
-    [false, 61],
-    [true, 0],
-  ] as const) {
-    try {
-      resolveTimeout(background, timeout);
-      throw new Error("timeout validation self-check failed");
-    } catch (error) {
-      if ((error as Error).message === "timeout validation self-check failed") throw error;
-    }
-  }
+
+  if (formatDuration(0) !== "0s") throw new Error("formatDuration 0");
+  if (formatDuration(5000) !== "5s") throw new Error("formatDuration 5s");
+  if (formatDuration(65000) !== "1m5s") throw new Error("formatDuration 65s");
+
+  console.log("All self-checks passed.");
 }
