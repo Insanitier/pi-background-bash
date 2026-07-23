@@ -31,6 +31,7 @@ type Task = {
   pid: number;
   startedAt: number;
   cwd: string;
+  exitCode?: number;
   // File-based task fields (explicit background via runner.sh)
   directory?: string;
   watcher?: FSWatcher;
@@ -39,7 +40,7 @@ type Task = {
   proc?: ChildProcess;
   logPath?: string;
   exit?: Promise<number | null>;
-  done?: boolean; // marked when completed, kept for output retrieval
+  done?: boolean; // marked when completed
 };
 
 // ── File helpers (explicit background via runner.sh) ───────────────────────
@@ -156,21 +157,23 @@ function formatDuration(ms: number): string {
   return mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
 }
 
-function makeCompletionText(task: Task, exitCode: number, output: string): string {
+function makeHeader(task: Task, exitCode: number): string {
   const dur = formatDuration(Date.now() - task.startedAt);
   const label = task.command.length > 60 ? task.command.slice(0, 57) + "..." : task.command;
-  // unnamed task → quoted command like patty: "command"
   const display = `"${label}"`;
+  if (exitCode === 0) return `✓ ${display} (${dur}, ${task.id})`;
+  return `✗ ${display} (${dur}, ${task.id}, exit ${exitCode})`;
+}
 
-  if (exitCode === 0) {
-    return `✓ ${display} (${dur}, ${task.id})`;
-  }
+/** Suppress notification for tasks that finish very quickly (<2s) —
+ *  the "started" message is still fresh, no need for a duplicate. */
+function shouldNotify(task: Task): boolean {
+  return Date.now() - task.startedAt >= 2_000;
+}
 
-  // Failure: include output tail
+function makeFailureDetails(output: string): string {
   const result = truncateTail(output, { maxBytes: MAX_OUTPUT_BYTES, maxLines: MAX_OUTPUT_LINES });
-  const header = `✗ ${display} (${dur}, ${task.id}, exit ${exitCode})`;
-  if (!result.content) return header;
-  return `${header}\n\n\`\`\`\n${result.content}\n\`\`\``;
+  return result.content || "";
 }
 
 // ── Status bar ──────────────────────────────────────────────────────────────
@@ -180,18 +183,22 @@ let sidebarTicker: NodeJS.Timeout | undefined;
 function renderSidebar(tasks: Map<string, Task>, ui: ExtensionUIContext): void {
   const running: Task[] = [];
   let doneCount = 0;
+  let failCount = 0;
   for (const task of tasks.values()) {
     if (task.directory) {
-      if (isFileTaskDone(task)) doneCount++;
-      else running.push(task);
+      if (isFileTaskDone(task)) {
+        if (task.exitCode !== undefined && task.exitCode !== 0) failCount++;
+        else doneCount++;
+      } else running.push(task);
     } else if (task.done) {
-      doneCount++;
+      if (task.exitCode !== undefined && task.exitCode !== 0) failCount++;
+      else doneCount++;
     } else {
       running.push(task);
     }
   }
 
-  if (running.length === 0 && doneCount === 0) {
+  if (running.length === 0 && doneCount === 0 && failCount === 0) {
     if (sidebarTicker) {
       clearInterval(sidebarTicker);
       sidebarTicker = undefined;
@@ -213,6 +220,7 @@ function renderSidebar(tasks: Map<string, Task>, ui: ExtensionUIContext): void {
   const parts: string[] = [];
   if (running.length > 0) parts.push(`${running.length} running`);
   if (doneCount > 0) parts.push(`${doneCount} done`);
+  if (failCount > 0) parts.push(`${failCount} failed`);
   const statusText = `▶ ${parts.join(", ")}`;
   const key = `${pills.join("\n")}|${statusText}`;
   if (key !== sidebarLastKey) {
@@ -269,16 +277,25 @@ export default function (pi: ExtensionAPI) {
       const output = await readFile(fileTaskOutput(task), "utf8");
       if (!Number.isInteger(exitCode)) throw new Error("invalid exit code");
 
+      task.exitCode = exitCode;
       await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
-      pi.sendMessage(
-        {
-          customType: "background-bash-completion",
-          content: makeCompletionText(task, exitCode, output),
-          details: { exitCode, taskId: task.id },
-          display: true,
-        },
-        { deliverAs: "followUp", triggerTurn: true },
-      );
+
+      const header = makeHeader(task, exitCode);
+      if (exitCode !== 0 || shouldNotify(task)) {
+        pi.sendMessage(
+          {
+            customType: "background-bash-completion",
+            content: header,
+            details: {
+              exitCode,
+              taskId: task.id,
+              output: exitCode !== 0 ? makeFailureDetails(output) : undefined,
+            },
+            display: true,
+          },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      }
       renderSidebar(tasks, ui);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
@@ -300,16 +317,24 @@ export default function (pi: ExtensionAPI) {
       output = readTail(logPath, MAX_OUTPUT_BYTES);
     } catch { /* best-effort */ }
 
+    task.exitCode = code ?? 1;
+    task.done = true;
+
+    const exitCode = code ?? 1;
+    const header = makeHeader(task, exitCode);
     pi.sendMessage(
       {
         customType: "background-bash-completion",
-        content: makeCompletionText(task, code ?? 1, output),
-        details: { exitCode: code, taskId: task.id },
+        content: header,
+        details: {
+          exitCode,
+          taskId: task.id,
+          output: exitCode !== 0 ? makeFailureDetails(output) : undefined,
+        },
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
     );
-    task.done = true;
     renderSidebar(tasks, ui);
   };
 
@@ -612,9 +637,10 @@ export default function (pi: ExtensionAPI) {
 
         const items = all.map(t => {
           const isTerminal = t.done || (t.directory && isFileTaskDone(t));
-          const icon = isTerminal ? "✓" : "▶";
+          const failed = t.exitCode !== undefined && t.exitCode !== 0;
+          const icon = failed ? "✗" : isTerminal ? "✓" : "▶";
           const cmd = t.command.length > 40 ? t.command.slice(0, 37) + "..." : t.command;
-          const status = isTerminal ? "done" : `running (${formatDuration(Date.now() - t.startedAt)})`;
+          const status = isTerminal ? (failed ? "failed" : "done") : `running (${formatDuration(Date.now() - t.startedAt)})`;
           return `${icon} ${t.id.slice(-8)}: ${cmd} · ${status}`;
         });
 
