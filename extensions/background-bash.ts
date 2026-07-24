@@ -281,7 +281,7 @@ export default function (pi: ExtensionAPI) {
       await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
 
       const header = makeHeader(task, exitCode);
-      if (exitCode !== 0 || shouldNotify(task)) {
+      if (shouldNotify(task)) {
         pi.sendMessage(
           {
             customType: "background-bash-completion",
