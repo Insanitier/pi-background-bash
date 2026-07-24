@@ -249,6 +249,7 @@ export default function (pi: ExtensionAPI) {
   );
 
   const tasks = new Map<string, Task>();
+  let sessionStale = false;
 
   // ── File-based task lifecycle ────────────────────────────────────────────
   const stopWatching = (task: Task): void => {
@@ -280,6 +281,7 @@ export default function (pi: ExtensionAPI) {
       task.exitCode = exitCode;
       await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
 
+      if (sessionStale) return;
       const header = makeHeader(task, exitCode);
       if (shouldNotify(task)) {
         pi.sendMessage(
@@ -320,6 +322,7 @@ export default function (pi: ExtensionAPI) {
     task.exitCode = code ?? 1;
     task.done = true;
 
+    if (sessionStale) return;
     const exitCode = code ?? 1;
     const header = makeHeader(task, exitCode);
     pi.sendMessage(
@@ -724,6 +727,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
+    sessionStale = true;
     stopSidebarTicker();
     for (const task of tasks.values()) {
       stopWatching(task);
