@@ -553,11 +553,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "background_task",
     label: "background_task",
-    description: "List or stop background tasks. Shows both file-based and auto-backgrounded tasks.",
+    description: "List or stop background tasks. Shows running tasks by default.",
     promptSnippet: "List or stop background tasks",
     promptGuidelines: [
       "Use background_task to list or kill a background task.",
-      "Background tasks auto-notify on completion with a short status line.",
+      "Background tasks auto-notify on completion with a short status line — don't poll.",
     ],
     parameters: taskSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -566,21 +566,15 @@ export default function (pi: ExtensionAPI) {
       if (params.action === "list") {
         const lines: string[] = [];
         for (const task of tasks.values()) {
+          const running = task.directory ? !isFileTaskDone(task) : !task.done;
+          if (!running) continue; // only running tasks, done ones auto-notify
           const seconds = Math.floor((Date.now() - task.startedAt) / 1000);
           const kind = task.directory ? "bg" : "auto";
-          let status: string;
-          if (task.directory) {
-            if (isFileTaskDone(task)) status = "done";
-            else status = "running";
-          } else {
-            status = task.done ? "done" : "running";
-          }
-          if (status === "running") lines.push(`${task.id} ${kind} ${seconds}s`);
-          else lines.push(`${task.id} ${kind} ${seconds}s [${status}]`);
+          lines.push(`${task.id} ${kind} ${seconds}s`);
         }
-        renderSidebar(tasks, ui); // refresh sidebar in case it's stale
+        renderSidebar(tasks, ui);
         return {
-          content: [{ type: "text" as const, text: lines.length ? lines.join("\n") : "No background tasks." }],
+          content: [{ type: "text" as const, text: lines.length ? lines.join("\n") : "No running background tasks." }],
           details: { tasks: lines.length },
         };
       }
