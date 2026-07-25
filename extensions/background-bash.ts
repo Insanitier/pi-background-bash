@@ -476,8 +476,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   const taskSchema = Type.Object({
-    action: StringEnum(["list", "kill"] as const),
-    taskId: Type.Optional(Type.String({ description: "Task ID required by kill" })),
+    action: StringEnum(["list", "kill", "wait"] as const),
+    taskId: Type.Optional(Type.String({ description: "Task ID" })),
   });
 
   // ── Register tools ───────────────────────────────────────────────────────
@@ -494,7 +494,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Foreground commands auto-background after timeout instead of failing.",
       "Use run_in_background=true for commands expected to run long.",
-      "Never `sleep N` to wait for something — use jobs attach or an until loop.",
+      "Never `sleep N` to wait for something — use background_task wait <id> or an until loop.",
       "Use background_task to list or kill running tasks.",
     ],
     parameters: bashParamSchema,
@@ -553,11 +553,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "background_task",
     label: "background_task",
-    description: "List or stop background tasks. Shows running tasks by default.",
-    promptSnippet: "List or stop background tasks",
+    description: "List, stop, or wait for background tasks. Shows running tasks by default.",
+    promptSnippet: "List, stop, or wait for background tasks",
     promptGuidelines: [
-      "Use background_task to list or kill a background task.",
-      "Background tasks auto-notify on completion with a short status line — don't poll.",
+      "Use background_task to list, kill, or wait for a background task.",
+      "Background tasks auto-notify on completion — don't poll. Use wait to block until a task finishes.",
     ],
     parameters: taskSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -567,7 +567,7 @@ export default function (pi: ExtensionAPI) {
         const lines: string[] = [];
         for (const task of tasks.values()) {
           const running = task.directory ? !isFileTaskDone(task) : !task.done;
-          if (!running) continue; // only running tasks, done ones auto-notify
+          if (!running) continue;
           const seconds = Math.floor((Date.now() - task.startedAt) / 1000);
           const kind = task.directory ? "bg" : "auto";
           lines.push(`${task.id} ${kind} ${seconds}s`);
@@ -576,6 +576,33 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{ type: "text" as const, text: lines.length ? lines.join("\n") : "No running background tasks." }],
           details: { tasks: lines.length },
+        };
+      }
+
+      if (params.action === "wait") {
+        if (!params.taskId) throw new Error("taskId is required for wait.");
+        const task = tasks.get(params.taskId);
+        if (!task) throw new Error(`Unknown background task: ${params.taskId}`);
+
+        const isRunning = (): boolean => task.directory ? !isFileTaskDone(task) : !task.done;
+        if (!isRunning()) {
+          return {
+            content: [{ type: "text" as const, text: `Task ${task.id} already finished (exit ${task.exitCode ?? "?"}).` }],
+            details: undefined,
+          };
+        }
+
+        // Block until the task completes — replaces polling
+        while (isRunning()) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+
+        const dur = formatDuration(Date.now() - task.startedAt);
+        const label = task.command.length > 40 ? task.command.slice(0, 37) + "..." : task.command;
+        const status = task.exitCode === 0 ? "completed" : task.exitCode !== undefined ? `failed (exit ${task.exitCode})` : "done";
+        return {
+          content: [{ type: "text" as const, text: `Task ${task.id} ${status} (${dur}): ${label}` }],
+          details: undefined,
         };
       }
 
