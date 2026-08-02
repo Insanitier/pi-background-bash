@@ -724,7 +724,7 @@ export default function (pi: ExtensionAPI) {
               details: { taskId: task.id },
               display: true,
             },
-            { deliverAs: "followUp", triggerTurn: true },
+            { deliverAs: "steer", triggerTurn: true },
           );
           continue;
         }
