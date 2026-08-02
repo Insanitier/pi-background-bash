@@ -706,6 +706,12 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (action === "Kill") {
+          // Ask for a reason so the agent isn't left guessing why
+          const reason = await ui.input(
+            `Kill task ${label}?`,
+            "Reason (sent to agent, optional)",
+          );
+          if (reason === undefined) continue; // cancelled — abort kill
           if (task.directory) {
             stopWatching(task);
             try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
@@ -717,11 +723,12 @@ export default function (pi: ExtensionAPI) {
           }
           renderSidebar(tasks, ui);
           const cmdLabel = task.command.length > 60 ? task.command.slice(0, 57) + "..." : task.command;
+          const reasonSuffix = reason.trim() ? `: ${reason.trim()}` : "";
           pi.sendMessage(
             {
               customType: "background-bash-completion",
-              content: `⊘ ${cmdLabel} (${task.id}) — killed by user`,
-              details: { taskId: task.id },
+              content: `⊘ ${cmdLabel} (${task.id}) — killed by user${reasonSuffix}`,
+              details: { taskId: task.id, reason: reason.trim() || undefined },
               display: true,
             },
             { deliverAs: "steer", triggerTurn: true },
