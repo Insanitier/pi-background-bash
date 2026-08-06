@@ -464,9 +464,6 @@ export default function (pi: ExtensionAPI) {
   // ── Schema ───────────────────────────────────────────────────────────────
   const bashParamSchema = Type.Object({
     command: Type.String({ description: "Bash command to execute" }),
-    timeout: Type.Optional(Type.Number({
-      description: "Foreground timeout in seconds before auto-background (default: 120)",
-    })),
     run_in_background: Type.Optional(Type.Boolean({
       description: "Start in background immediately (fire-and-forget)",
     })),
@@ -487,19 +484,20 @@ export default function (pi: ExtensionAPI) {
     name: "bash",
     label: "bash",
     description:
-      "Run a bash command. Long-running foreground commands auto-background after timeout (default 120s). " +
+      "Run a bash command. Foreground commands auto-background after 120s and keep running; " +
+      "completion is reported via notification — commands never fail from timeout. " +
       "Set run_in_background=true to start in background immediately. " +
       "Use background_task to list or kill running tasks.",
-    promptSnippet: "Run shell commands; long-running commands auto-background or use run_in_background=true",
+    promptSnippet: "Run shell commands; long-running commands auto-background after 120s or use run_in_background=true",
     promptGuidelines: [
-      "Foreground commands auto-background after timeout instead of failing.",
+      "Foreground commands auto-background after 120s and keep running — commands never fail from timeout.",
       "Use run_in_background=true for commands expected to run long.",
       "Never `sleep N` to wait for something — use background_task wait <id> or an until loop.",
       "Use background_task to list or kill running tasks.",
     ],
     parameters: bashParamSchema,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const p = params as { command: string; timeout?: number; run_in_background?: boolean; description?: string };
+      const p = params as { command: string; run_in_background?: boolean; description?: string };
       const ui = ctx.ui;
 
       if (p.run_in_background) {
