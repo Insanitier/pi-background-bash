@@ -476,7 +476,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   const taskSchema = Type.Object({
-    action: StringEnum(["list", "kill", "wait"] as const),
+    action: StringEnum(["list", "kill", "wait", "output"] as const),
     taskId: Type.Optional(Type.String({ description: "Task ID" })),
   });
 
@@ -553,11 +553,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "background_task",
     label: "background_task",
-    description: "List, stop, or wait for background tasks. Shows running tasks by default.",
-    promptSnippet: "List, stop, or wait for background tasks",
+    description: "List, stop, wait for, or read output of background tasks.",
+    promptSnippet: "Manage background tasks: list, kill, wait, output",
     promptGuidelines: [
-      "Use background_task to list, kill, or wait for a background task.",
+      "Use background_task to list, kill, wait for, or read output of a background task.",
       "Background tasks auto-notify on completion — don't poll. Use wait to block until a task finishes.",
+      "Completions report status only (success: no output; failure: truncated tail). Use output <id> to read the FULL log when you need the details.",
     ],
     parameters: taskSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -602,6 +603,32 @@ export default function (pi: ExtensionAPI) {
         const status = task.exitCode === 0 ? "completed" : task.exitCode !== undefined ? `failed (exit ${task.exitCode})` : "done";
         return {
           content: [{ type: "text" as const, text: `Task ${task.id} ${status} (${dur}): ${label}` }],
+          details: undefined,
+        };
+      }
+
+      if (params.action === "output") {
+        if (!params.taskId) throw new Error("taskId is required for output.");
+        const t = tasks.get(params.taskId)
+          ?? [...tasks.values()].find(j => j.id === params.taskId || j.id.endsWith(params.taskId));
+        if (!t) throw new Error(`Unknown background task: ${params.taskId}`);
+
+        let output: string;
+        if (t.directory) {
+          const p = fileTaskOutput(t);
+          if (!existsSync(p)) return { content: [{ type: "text" as const, text: "No output yet." }], details: undefined };
+          output = (await readFile(p, "utf8")) || "(empty)";
+        } else if (t.logPath) {
+          try {
+            output = (await readFile(t.logPath, "utf8")) || "(empty)";
+          } catch {
+            return { content: [{ type: "text" as const, text: "No output yet." }], details: undefined };
+          }
+        } else {
+          return { content: [{ type: "text" as const, text: "No output available." }], details: undefined };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Full output of ${t.id}:\n${output}` }],
           details: undefined,
         };
       }
