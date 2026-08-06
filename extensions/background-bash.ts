@@ -295,7 +295,7 @@ export default function (pi: ExtensionAPI) {
             },
             display: true,
           },
-          { deliverAs: "followUp", triggerTurn: true },
+          { deliverAs: "steer", triggerTurn: true },
         );
       }
       renderSidebar(tasks, ui);
@@ -336,7 +336,7 @@ export default function (pi: ExtensionAPI) {
         },
         display: true,
       },
-      { deliverAs: "followUp", triggerTurn: true },
+      { deliverAs: "steer", triggerTurn: true },
     );
     renderSidebar(tasks, ui);
   };
