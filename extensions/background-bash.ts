@@ -483,14 +483,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bash",
     label: "bash",
-    description:
-      "Run a bash command. Foreground commands auto-background after 120s and keep running; " +
-      "completion is reported via notification — commands never fail from timeout. " +
-      "Set run_in_background=true to start in background immediately. " +
-      "Use background_task to list or kill running tasks.",
-    promptSnippet: "Run shell commands; long-running commands auto-background after 120s or use run_in_background=true",
+    description: "Run a bash command. Long-running foreground commands auto-background after 120s and keep running.",
+    promptSnippet: "Run shell commands (long-running ones auto-background after 120s)",
     promptGuidelines: [
-      "Foreground commands auto-background after 120s and keep running — commands never fail from timeout.",
       "Use run_in_background=true for commands expected to run long.",
       "Never `sleep N` to wait for something — use background_task wait <id> or an until loop.",
       "Use background_task to list or kill running tasks.",
@@ -554,7 +549,6 @@ export default function (pi: ExtensionAPI) {
     description: "List, stop, wait for, or read output of background tasks.",
     promptSnippet: "Manage background tasks: list, kill, wait, output",
     promptGuidelines: [
-      "Use background_task to list, kill, wait for, or read output of a background task.",
       "Background tasks auto-notify on completion — don't poll. Use wait to block until a task finishes.",
       "Completions report status only (success: no output; failure: truncated tail). Use output <id> to read the FULL log when you need the details.",
     ],
