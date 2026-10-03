@@ -295,7 +295,7 @@ export default function (pi: ExtensionAPI) {
             },
             display: true,
           },
-          { deliverAs: "steer", triggerTurn: true },
+          { deliverAs: "followUp", triggerTurn: true },
         );
       }
       renderSidebar(tasks, ui);
@@ -336,7 +336,7 @@ export default function (pi: ExtensionAPI) {
         },
         display: true,
       },
-      { deliverAs: "steer", triggerTurn: true },
+      { deliverAs: "followUp", triggerTurn: true },
     );
     renderSidebar(tasks, ui);
   };
@@ -750,7 +750,7 @@ export default function (pi: ExtensionAPI) {
               details: { taskId: task.id, reason: reason.trim() || undefined },
               display: true,
             },
-            { deliverAs: "steer", triggerTurn: true },
+            { deliverAs: "followUp", triggerTurn: true },
           );
           continue;
         }
