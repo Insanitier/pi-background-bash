@@ -42,9 +42,6 @@ type Task = {
   logPath?: string;
   exit?: Promise<number | null>;
   done?: boolean; // marked when completed
-  // Taken over from an earlier session by recoverFileTasks: its completion is
-  // unrelated to whatever this session is doing, so it must not interrupt it.
-  recovered?: boolean;
   cancelled?: boolean; // stopped on purpose: it must not also report completion
 };
 
@@ -305,11 +302,10 @@ export default function (pi: ExtensionAPI) {
             },
             display: true,
           },
-          // Steer rides along with what this session is already doing; an adopted task
-          // is unrelated to it, so it waits for the turn to end instead of interrupting.
-          task.recovered
-            ? { deliverAs: "followUp", triggerTurn: true }
-            : { deliverAs: "steer", triggerTurn: true },
+          // Always steer, never followUp: a follow-up waits in the agent's in-memory
+          // queue until the run would otherwise stop, and pi drops that queue when the
+          // user aborts — leaving a session entry the model never saw.
+          { deliverAs: "steer", triggerTurn: true },
         );
       }
       renderSidebar(tasks, ui);
@@ -379,7 +375,6 @@ export default function (pi: ExtensionAPI) {
           cwd: meta.cwd,
           startedAt: meta.startedAt,
           directory: taskDir,
-          recovered: true,
         };
         try {
           task.command = (await readFile(join(taskDir, "command.sh"), "utf8")).trim();
@@ -781,7 +776,10 @@ export default function (pi: ExtensionAPI) {
               details: { taskId: task.id, reason: reason.trim() || undefined },
               display: true,
             },
-            { deliverAs: "followUp", triggerTurn: true },
+            // Same reason as the completion notice: followUp can be dropped before the
+            // run would stop, and this message is the only way the typed reason reaches
+            // the model.
+            { deliverAs: "steer", triggerTurn: true },
           );
           continue;
         }

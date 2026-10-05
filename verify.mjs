@@ -94,19 +94,30 @@ const until = async (predicate, timeoutMs = 8_000) => {
 
 // ── 2. A stub Pi host: record tools, messages and UI frames ─────────────────
 const tools = new Map();
+const commands = new Map();
 const calls = { messages: [], status: [], widgets: [] };
+const KILL_REASON = "理由能不能送到";
+let pickedKill = false;
 const ui = {
 	setWidget: (key, value) => calls.widgets.push([key, value]),
 	setStatus: (key, value) => calls.status.push([key, value]),
 	notify: () => {},
-	select: async () => undefined,
-	input: async () => undefined,
+	select: async (_title, items) => {
+		if (pickedKill) return undefined;
+		const kill = items.find((item) => item === "Kill");
+		if (kill !== undefined) {
+			pickedKill = true;
+			return kill;
+		}
+		return items[0];
+	},
+	input: async () => KILL_REASON,
 	editor: async () => {},
 };
 const pi = {
 	registerTool: (def) => tools.set(def.name, def),
 	registerMessageRenderer: () => {},
-	registerCommand: () => {},
+	registerCommand: (name, def) => commands.set(name, def),
 	on: () => {},
 	sendMessage: (message, opts) => calls.messages.push({ ...message, opts }),
 };
@@ -195,6 +206,25 @@ check(
 	JSON.stringify({ result: stopped.content[0].text, cards: cardsFor(doomedId).length }),
 );
 
+// ── 6b. A user kill from /bg delivers the typed reason as steer ────────────
+const victim = await run("bash", { command: "sleep 30", run_in_background: true });
+const victimId = String(victim.content[0].text).match(/task ([0-9a-f]{16})/)?.[1];
+await commands.get("bg").handler(undefined, ctx);
+await new Promise((resolve) => setTimeout(resolve, 400));
+const killNotice = calls.messages.find(
+	(m) => m.customType === "background-bash-completion" && /killed by user/.test(String(m.content)),
+);
+check(
+	"a user kill from /bg delivers the typed reason with steer",
+	victimId !== undefined &&
+		killNotice !== undefined &&
+		String(killNotice.content).includes(victimId) &&
+		killNotice.details?.reason === KILL_REASON &&
+		killNotice.opts?.deliverAs === "steer" &&
+		killNotice.opts?.triggerTurn === true,
+	JSON.stringify({ id: victimId, notice: killNotice?.content, opts: killNotice?.opts, reason: killNotice?.details?.reason }),
+);
+
 // ── 7. A killed auto-backgrounded task reports nothing ─────────────────────
 const backgrounded = await run("bash", { command: "sleep 30" });
 const autoId = String(backgrounded.content[0].text).match(/Auto-backgrounded as (bg-[0-9a-f]{8})/)?.[1];
@@ -215,6 +245,13 @@ check(
 	"the widget and status line clear when nothing is running",
 	cleared,
 	JSON.stringify(calls.status.slice(-4)),
+);
+
+// ── 8b. Every notice rides into the run: never a follow-up ─────────────────
+check(
+	"every notice uses steer, never a follow-up that can be dropped",
+	calls.messages.length > 0 && calls.messages.every((m) => m.opts?.deliverAs === "steer"),
+	JSON.stringify(calls.messages.map((m) => m.opts)),
 );
 
 // ── 9. Cleanup ─────────────────────────────────────────────────────────────
