@@ -11,5 +11,8 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "scripts": {
+    "test": "node verify.mjs"
   }
 }

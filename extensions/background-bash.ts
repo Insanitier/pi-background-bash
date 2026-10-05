@@ -19,7 +19,8 @@ const ROOT_DIR = join(tmpdir(), "pi-background-bash");
 const LOG_DIR = "/tmp/pi-bg";
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_LINES = 200;
-const AUTO_BG_TIMEOUT_MS = 120_000;
+// Overridable so the verify script can exercise the auto-background path.
+const AUTO_BG_TIMEOUT_MS = Number(process.env.BACKGROUND_BASH_AUTO_BG_MS ?? 120_000);
 const QUICK_COMPLETION_MS = 2_000;
 const FOREGROUND_TAIL_BYTES = 4_096;
 const PREVIEW_CHARS = 40;
@@ -41,6 +42,10 @@ type Task = {
   logPath?: string;
   exit?: Promise<number | null>;
   done?: boolean; // marked when completed
+  // Taken over from an earlier session by recoverFileTasks: its completion is
+  // unrelated to whatever this session is doing, so it must not interrupt it.
+  recovered?: boolean;
+  cancelled?: boolean; // stopped on purpose: it must not also report completion
 };
 
 // ── File helpers (explicit background via runner.sh) ───────────────────────
@@ -198,7 +203,9 @@ function renderSidebar(tasks: Map<string, Task>, ui: ExtensionUIContext): void {
     }
   }
 
-  if (running.length === 0 && doneCount === 0 && failCount === 0) {
+  // Finished tasks only feed the counts: once nothing runs, the widget and status line
+  // go away instead of lingering for the rest of the session.
+  if (running.length === 0) {
     if (sidebarTicker) {
       clearInterval(sidebarTicker);
       sidebarTicker = undefined;
@@ -250,6 +257,9 @@ export default function (pi: ExtensionAPI) {
 
   const tasks = new Map<string, Task>();
   let sessionStale = false;
+  // Tasks with a `background_task wait` in flight: that waiter hands the same outcome
+  // to the model itself, so a completion card for it would only repeat it.
+  const waitInFlight = new Set<string>();
 
   // ── File-based task lifecycle ────────────────────────────────────────────
   const stopWatching = (task: Task): void => {
@@ -283,7 +293,7 @@ export default function (pi: ExtensionAPI) {
 
       if (sessionStale) return;
       const header = makeHeader(task, exitCode);
-      if (shouldNotify(task)) {
+      if (shouldNotify(task) && !waitInFlight.has(task.id)) {
         pi.sendMessage(
           {
             customType: "background-bash-completion",
@@ -295,7 +305,11 @@ export default function (pi: ExtensionAPI) {
             },
             display: true,
           },
-          { deliverAs: "followUp", triggerTurn: true },
+          // Steer rides along with what this session is already doing; an adopted task
+          // is unrelated to it, so it waits for the turn to end instead of interrupting.
+          task.recovered
+            ? { deliverAs: "followUp", triggerTurn: true }
+            : { deliverAs: "steer", triggerTurn: true },
         );
       }
       renderSidebar(tasks, ui);
@@ -323,6 +337,11 @@ export default function (pi: ExtensionAPI) {
     task.done = true;
 
     if (sessionStale) return;
+    // Stopped on purpose, or already handed to a waiter: no completion card.
+    if (task.cancelled || waitInFlight.has(task.id)) {
+      renderSidebar(tasks, ui);
+      return;
+    }
     const exitCode = code ?? 1;
     const header = makeHeader(task, exitCode);
     pi.sendMessage(
@@ -336,7 +355,7 @@ export default function (pi: ExtensionAPI) {
         },
         display: true,
       },
-      { deliverAs: "followUp", triggerTurn: true },
+      { deliverAs: "steer", triggerTurn: true },
     );
     renderSidebar(tasks, ui);
   };
@@ -360,6 +379,7 @@ export default function (pi: ExtensionAPI) {
           cwd: meta.cwd,
           startedAt: meta.startedAt,
           directory: taskDir,
+          recovered: true,
         };
         try {
           task.command = (await readFile(join(taskDir, "command.sh"), "utf8")).trim();
@@ -486,9 +506,11 @@ export default function (pi: ExtensionAPI) {
     description: "Run a bash command. Long-running foreground commands auto-background after 120s and keep running.",
     promptSnippet: "Run shell commands (long-running ones auto-background after 120s)",
     promptGuidelines: [
-      "Use run_in_background=true for commands expected to run long.",
-      "Never `sleep N` to wait for something — use background_task wait <id> or an until loop.",
-      "Use background_task to list or kill running tasks.",
+      "Keep long-running work in the submitted shell's foreground; use run_in_background=true to background the tool, not the command.",
+      "Do not hand-detach with nohup, setsid, disown, or a trailing `&`: detached descendants are not tracked, reported, or killed.",
+      "For one-shot polling, submit an exiting loop such as `until <condition>; do sleep N; done` — never a bare `sleep N` wait.",
+      "Terminal status describes the submitted shell, not arbitrary descendant processes.",
+      "Use background_task to list, wait for, read output of, or stop running tasks.",
     ],
     parameters: bashParamSchema,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -585,9 +607,16 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        // Block until the task completes — replaces polling
-        while (isRunning()) {
-          await new Promise(r => setTimeout(r, 500));
+        // Block until the task completes — replaces polling. While this wait is in
+        // flight the completion card is suppressed, because this result carries the
+        // same outcome; without it the card repeats what the model already has.
+        waitInFlight.add(task.id);
+        try {
+          while (isRunning()) {
+            await new Promise(r => setTimeout(r, 500));
+          }
+        } finally {
+          waitInFlight.delete(task.id);
         }
 
         const dur = formatDuration(Date.now() - task.startedAt);
@@ -638,12 +667,15 @@ export default function (pi: ExtensionAPI) {
             details: undefined,
           };
         }
-        stopWatching(task);
+        // Signal first: a failed kill must leave the watcher armed, otherwise the
+        // task would never report anything again.
         try { process.kill(-task.pid, "SIGTERM"); } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
         }
         await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
+        stopWatching(task);
       } else {
+        task.cancelled = true;
         try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
         try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
         tasks.delete(task.id);
@@ -732,10 +764,11 @@ export default function (pi: ExtensionAPI) {
           );
           if (reason === undefined) continue; // cancelled — abort kill
           if (task.directory) {
-            stopWatching(task);
             try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
             await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
+            stopWatching(task);
           } else {
+            task.cancelled = true;
             try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
             try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
             tasks.delete(task.id);
