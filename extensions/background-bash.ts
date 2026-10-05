@@ -506,11 +506,9 @@ export default function (pi: ExtensionAPI) {
     description: "Run a bash command. Long-running foreground commands auto-background after 120s and keep running.",
     promptSnippet: "Run shell commands (long-running ones auto-background after 120s)",
     promptGuidelines: [
-      "Keep long-running work in the submitted shell's foreground; use run_in_background=true to background the tool, not the command.",
-      "Do not hand-detach with nohup, setsid, disown, or a trailing `&`: detached descendants are not tracked, reported, or killed.",
-      "For one-shot polling, submit an exiting loop such as `until <condition>; do sleep N; done` — never a bare `sleep N` wait.",
-      "Terminal status describes the submitted shell, not arbitrary descendant processes.",
-      "Use background_task to list, wait for, read output of, or stop running tasks.",
+      "Use run_in_background=true for commands expected to run long.",
+      "Never `sleep N` to wait for something — use background_task wait <id> or an until loop.",
+      "Use background_task to list or kill running tasks.",
     ],
     parameters: bashParamSchema,
     async execute(toolCallId, params, signal, onUpdate, ctx) {

@@ -135,12 +135,12 @@ try {
 
 const guidance = (tools.get("bash").promptGuidelines ?? []).join("\n");
 check(
-	"the bash guidance keeps long work in the tracked shell",
-	/don't|do not/i.test(guidance) &&
-		/no[hu]up|setsid|disown/i.test(guidance) &&
-		/not tracked, reported, or killed/i.test(guidance) &&
-		!/never `sleep N` to wait for something — use background_task wait/i.test(guidance),
-	guidance,
+	"the bash guidance stays compact and about the tool",
+	(tools.get("bash").promptGuidelines ?? []).length === 3 &&
+		/run_in_background=true/.test(guidance) &&
+		/until loop/.test(guidance) &&
+		/background_task/.test(guidance) &&
+		!/no[hu]up|setsid|disown/i.test(guidance),
 );
 
 // ── 4. Explicit background task: completion arrives as steer ────────────────
