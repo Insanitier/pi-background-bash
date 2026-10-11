@@ -25,6 +25,8 @@
  *  12. the log of a task killed on purpose survives, so the path on its card stays valid
  *  13. one representation: every task is a detached process with a log under the session
  *      directory, and shutdown kills the lot — nothing is restored on the next start
+ *  14. the wait paths the model can actually hit: waiting on a task that already finished,
+ *      and aborting a wait — the latter must hand the task back to the completion card
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -137,7 +139,7 @@ const ctx = { ui, cwd: WORK_DIR, sessionManager: { getSessionId: () => SESSION_I
 const cards = () => calls.messages.filter((m) => m.customType === "background-bash-completion");
 const cardsFor = (id) => cards().filter((m) => m.details?.taskId === id);
 const idOf = (text) => String(text).match(/\(([0-9a-f]{16}|bg-[0-9a-f]{8})\)/)?.[1];
-const run = (name, params) => tools.get(name).execute("verify", params, undefined, undefined, ctx);
+const run = (name, params, signal) => tools.get(name).execute("verify", params, signal, undefined, ctx);
 const lastStatus = () => calls.status.at(-1)?.[1];
 
 // ── 3. Load the extension and register its tools ────────────────────────────
@@ -235,6 +237,48 @@ check(
 		cardsFor(snapshotId).length === 1 &&
 		String(laterCard?.content).split("\n").at(-1) === "completed",
 	JSON.stringify({ id: snapshotId, wait: boundedText, cards: cardsFor(snapshotId).length, card: laterCard?.content }),
+);
+
+// ── 5c. Waiting on a task that already finished ────────────────────────────
+const afterTheFact = firstId
+	? await run("background_task", { action: "wait", taskId: firstId, seconds: 0 })
+	: { content: [{ text: "" }] };
+const afterText = String(afterTheFact.content[0].text);
+const afterLines = afterText.split("\n");
+const afterLogIndex = afterLines.findIndex((line) => line.startsWith("Log: "));
+check(
+	"waiting on a finished task returns the same shape, immediately",
+	firstId !== undefined &&
+		afterLines.at(-1) === "completed" &&
+		afterLogIndex > 0 &&
+		afterLines[afterLogIndex - 1].includes("slow-enough-to-report") &&
+		afterLines[0].includes(firstId),
+	JSON.stringify({ id: firstId, text: afterText }),
+);
+
+// ── 5d. An aborted wait must not swallow the completion card ───────────────
+const cancelTask = await run("bash", { command: "echo cancel-me; sleep 2.5", run_in_background: true });
+const cancelId = idOf(cancelTask.content[0].text);
+const controller = new AbortController();
+const cancelledWait = cancelId
+	? run("background_task", { action: "wait", taskId: cancelId, seconds: 30 }, controller.signal)
+	: Promise.resolve({ content: [{ text: "" }] });
+await new Promise((resolve) => setTimeout(resolve, 300));
+controller.abort();
+const cancelled = await cancelledWait;
+const cancelledText = String(cancelled.content[0].text);
+const cancelCard = cancelId
+	? (await until(() => cardsFor(cancelId).length === 1, 8_000), cardsFor(cancelId)[0])
+	: undefined;
+check(
+	"an aborted wait reports itself cancelled and still lets the card through",
+	cancelId !== undefined &&
+		cancelledText.split("\n").at(-1) === "wait cancelled after 0s; still running, unaffected" &&
+		cancelledText.includes("cancel-me") &&
+		cancelledText.includes("Log: ") &&
+		cardsFor(cancelId).length === 1 &&
+		String(cancelCard?.content).split("\n").at(-1) === "completed",
+	JSON.stringify({ id: cancelId, wait: cancelledText, cards: cardsFor(cancelId).length, card: cancelCard?.content }),
 );
 
 // ── 6. A stopped task reports nothing ──────────────────────────────────────
@@ -353,6 +397,29 @@ check(
 		!/background_task output/.test((tools.get("background_task").promptGuidelines ?? []).join("\n")) &&
 		!/read output/.test(String(tools.get("background_task").description)),
 	JSON.stringify({ outputGone, guidelines: tools.get("background_task").promptGuidelines, description: tools.get("background_task").description }),
+);
+
+// ── 6g. Both entries end in the same terminal card ────────────────────────
+// Must outlive the hardcoded 2s quick-completion window, or the foreground path answers
+// directly and no task (and so no completion card) ever exists.
+const autoDone = await run("bash", { command: "echo bg-start; sleep 2.6; echo bg-done" });
+const autoDoneId = idOf(String(autoDone.content[0].text));
+const autoDoneCard = autoDoneId
+	? (await until(() => cardsFor(autoDoneId).length === 1, 8_000), cardsFor(autoDoneId)[0])
+	: undefined;
+const autoLines = String(autoDoneCard?.content ?? "").split("\n");
+const autoLogIndex = autoLines.findIndex((line) => line.startsWith("Log: "));
+const autoLogPath = autoLines[autoLogIndex]?.slice("Log: ".length) ?? "";
+check(
+	"an auto-backgrounded task ends in the same card shape as an explicit one",
+	autoDoneId !== undefined &&
+		autoLines.at(-1) === "completed" &&
+		autoLogIndex > 0 &&
+		autoLines[autoLogIndex - 1] === "bg-done" &&
+		// Same contract, same place on disk: the session directory, keyed by task id.
+		autoLogPath.startsWith(TASK_ROOT) &&
+		String(firstCard?.content ?? "").split("Log: ")[1]?.split("\n")[0].startsWith(TASK_ROOT) === true,
+	JSON.stringify({ id: autoDoneId, lines: autoLines, explicit: successLines.at(-2) }),
 );
 
 // ── 7. A killed auto-backgrounded task reports nothing ─────────────────────
