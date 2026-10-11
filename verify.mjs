@@ -29,9 +29,10 @@
  *      and aborting a wait — the latter must hand the task back to the completion card
  *  15. aborting a foreground command kills it (SIGKILL to its process group, the way the
  *      built-in bash tool does) instead of letting it run to completion
- *  16. uv mode (BACKGROUND_BASH_UV=1): pip and friends are refused with the uv equivalent,
- *      explicit interpreter paths included, python3 runs through uv, and other commands
- *      are untouched
+ *  16. Python tooling is routed through uv, unconditionally: pip and friends are refused
+ *      with the uv equivalent (explicit interpreter paths included), python3 runs through
+ *      uv, without uv it falls back to the real interpreter, and other commands are
+ *      untouched
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -89,8 +90,6 @@ process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 process.env.BACKGROUND_BASH_AUTO_BG_MS = "400";
 // Let the extension's own inline self-check run as part of this harness.
 process.env.BACKGROUND_BASH_SELF_TEST = "1";
-// Exercise the uv interception for the whole run; the extension defaults it to off.
-process.env.BACKGROUND_BASH_UV = "1";
 
 const SESSION_ID = `verify-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
 const WORK_DIR = join(HOME, "work");
@@ -182,7 +181,7 @@ check(
 		!/no[hu]up|setsid|disown/i.test(guidance),
 );
 
-// ── 3b. uv mode: Python tooling intercepted, everything else untouched ─────
+// ── 3b. Python tooling routed through uv: unconditional, no setting ─────────
 const uvFailure = async (command) => {
 	try {
 		await run("bash", { command });
@@ -195,13 +194,14 @@ const pipError = await uvFailure("pip install requests");
 const explicitPathError = await uvFailure(".venv/bin/python -m pip install requests");
 const plainCommand = await run("bash", { command: "echo plain-command-fine" });
 check(
-	"uv mode refuses pip with uv guidance, explicit interpreter paths included",
+	"pip is refused with uv guidance, explicit interpreter paths included",
 	/Use uv instead/.test(String(pipError)) &&
 		/Use uv instead/.test(String(explicitPathError)) &&
 		String(plainCommand.content[0].text).includes("plain-command-fine"),
 	JSON.stringify({ pipError, explicitPathError, plain: plainCommand.content[0].text }),
 );
 
+const shimDir = join(tmpdir(), "pi-background-bash", "shims");
 const hasUv = (() => {
 	try {
 		execFileSync("which", ["uv"], { stdio: "pipe" });
@@ -210,13 +210,49 @@ const hasUv = (() => {
 		return false;
 	}
 })();
-const shimDir = join(tmpdir(), "pi-background-bash", "shims");
-const redirected = await run("bash", { command: "python3 -c 'import sys; print(\"interpreter:\", sys.executable)'" });
+const redirected = await run("bash", {
+	command: `python3 -c 'import sys; print("interpreter:", sys.executable)'`,
+});
 const redirectedText = String(redirected.content[0].text);
 check(
-	"uv mode runs python3 through uv instead of the shim",
+	"python3 runs through uv instead of the shim",
 	!hasUv || (redirectedText.includes("interpreter:") && !redirectedText.includes(shimDir)),
 	JSON.stringify({ hasUv, redirected: redirectedText.slice(0, 240) }),
+);
+
+// Without uv on PATH the routing falls back to the interpreter that was already first on
+// PATH (upstream exits 127 there). pip stays blocked, because that is the policy itself.
+// The shim directory must be named explicitly: `PATH=x cmd` resolves cmd with the new PATH.
+const noUvPath = `PATH=${JSON.stringify(shimDir)}:/usr/bin:/bin`;
+const shimmedPip = String(await uvFailure(`${noUvPath} bash -c 'pip install requests'`));
+let uvReachable = true;
+try {
+	uvReachable = String(execFileSync("bash", ["-c", `${noUvPath} command -v uv`], { encoding: "utf8" })).trim().length > 0;
+} catch {
+	uvReachable = false;
+}
+let fallbackText = "";
+let groundTruthText = "";
+try {
+	fallbackText = String(
+		(await run("bash", { command: `${noUvPath} python3 -c 'import sys; print("fallback:", sys.executable)'` }))
+			.content[0].text,
+	);
+	groundTruthText = String(
+		(await run("bash", { command: `${noUvPath} /usr/bin/python3 -c 'import sys; print("fallback:", sys.executable)'` }))
+			.content[0].text,
+	);
+} catch (error) {
+	fallbackText = `THREW: ${error?.message}`;
+}
+check(
+	"without uv on PATH python3 falls back to the real interpreter, pip stays blocked",
+	uvReachable ||
+		(fallbackText === groundTruthText &&
+			fallbackText.includes("fallback:") &&
+			!fallbackText.includes("command not found") &&
+			/Use uv instead/.test(shimmedPip)),
+	JSON.stringify({ uvReachable, fallbackText, groundTruthText, shimmedPip: shimmedPip.trim() }),
 );
 
 // ── 4. Explicit background task: completion arrives as steer ────────────────

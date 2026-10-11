@@ -26,11 +26,10 @@ const AUTO_BG_TIMEOUT_MS = Number(process.env.BACKGROUND_BASH_AUTO_BG_MS ?? 120_
 const QUICK_COMPLETION_MS = 2_000;
 const FOREGROUND_TAIL_BYTES = 4_096;
 const PREVIEW_CHARS = 40;
-// uv mode: intercept Python tooling the way mitsuhiko/agent-stuff's uv extension does —
-// a PATH shim for anything the model types, plus a spawn-time check for explicit paths
-// (`.venv/bin/python -m pip`) that a PATH shim cannot see. Opt-in: nothing here fires
-// unless BACKGROUND_BASH_UV=1, so a machine without uv is unaffected.
-const UV_MODE = process.env.BACKGROUND_BASH_UV === "1";
+// Python tooling is routed through uv, the way mitsuhiko/agent-stuff's uv extension does
+// it: a PATH shim for anything the model types, plus a spawn-time check for explicit paths
+// (`.venv/bin/python -m pip`) that a PATH shim cannot see. Unconditional, as upstream: no
+// setting, no env var.
 const SHIM_DIR = join(ROOT_DIR, "shims");
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -62,9 +61,9 @@ function spawnWithFileOutput(command: string, cwd: string, logPath: string): {
 } {
   mkdirSync(dirname(logPath), { recursive: true });
   const fd = openSync(logPath, "w");
-  // The single spawn exit, so uv mode covers the foreground and the explicit background
+  // The single spawn exit, so the shims cover the foreground and the explicit background
   // path alike. The card still shows the command the model asked for, not this prefix.
-  const shellCommand = UV_MODE ? `export PATH=${JSON.stringify(SHIM_DIR)}:"$PATH"\n${command}` : command;
+  const shellCommand = `export PATH=${JSON.stringify(SHIM_DIR)}:"$PATH"\n${command}`;
   let proc: ChildProcess;
   try {
     proc = spawn("bash", ["-c", shellCommand], {
@@ -104,6 +103,11 @@ function killTree(pid: number): void {
 function abortMessage(tail: string, logPath: string): string {
   return ["Command aborted.", tail.trim(), `Log: ${logPath}`].filter(Boolean).join("\n");
 }
+
+/* No uv on PATH? The two halves differ on purpose. `python`/`python3` are a routing
+ * choice, so the shim falls back to the interpreter that was already first on PATH —
+ * a machine without uv keeps a working python. Blocking pip is the policy itself, so it
+ * stays blocked (the error names the uv command to use instead), exactly like upstream. */
 
 /** Python tooling uv replaces, refused before anything is spawned. Mirrors the checks in
  *  mitsuhiko/agent-stuff's uv extension, including explicit interpreter paths. */
@@ -590,11 +594,9 @@ export default function (pi: ExtensionAPI) {
       const p = params as { command: string; run_in_background?: boolean; description?: string };
       const ui = ctx.ui;
 
-      if (UV_MODE) {
-        await ensureShims();
-        const blocked = uvBlockedMessage(p.command);
-        if (blocked) throw new Error(blocked);
-      }
+      await ensureShims();
+      const blocked = uvBlockedMessage(p.command);
+      if (blocked) throw new Error(blocked);
 
       if (p.run_in_background) {
         // Explicit background: the same detached-process shape as the auto-background
