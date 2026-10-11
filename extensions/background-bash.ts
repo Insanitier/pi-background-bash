@@ -6,19 +6,18 @@ import { openSync, closeSync, fstatSync, readSync, unlinkSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import {
-  type ExtensionAPI,
-  type ExtensionUIContext,
-  truncateTail,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const ROOT_DIR = join(tmpdir(), "pi-background-bash");
 const LOG_DIR = "/tmp/pi-bg";
+// Failure cards keep the old, larger tail; every other card is deliberately small.
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_LINES = 200;
+const CARD_TAIL_CHARS = 2 * 1024;
+const CARD_TAIL_LINES = 20;
 // Overridable so the verify script can exercise the auto-background path.
 const AUTO_BG_TIMEOUT_MS = Number(process.env.BACKGROUND_BASH_AUTO_BG_MS ?? 120_000);
 const QUICK_COMPLETION_MS = 2_000;
@@ -151,6 +150,48 @@ function readTail(logPath: string, maxChars: number): string {
   }
 }
 
+/** Strip terminal escapes and control characters; keep tabs and newlines.
+ *  Without this a progress bar or a colouring library floods the card. */
+function sanitize(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0x1b) {
+      const next = text.charCodeAt(i + 1);
+      if (next === 0x5b) {
+        i += 1;
+        while (i + 1 < text.length && (text.charCodeAt(++i) < 0x40 || text.charCodeAt(i) > 0x7e)) { /* skip */ }
+      } else if (next === 0x5d) {
+        i += 1;
+        while (i + 1 < text.length) {
+          const c = text.charCodeAt(++i);
+          if (c === 0x07) break;
+          if (c === 0x1b && text.charCodeAt(i + 1) === 0x5c) { i += 1; break; }
+        }
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+    if (code === 0x0a || code === 0x09) out += text[i];
+    else if (code === 0x0d) out += "\n";
+    else if (code >= 0x20 && code !== 0x7f) out += text[i];
+  }
+  return out;
+}
+
+/** Last lines of a log, sanitized and bounded. Says so whenever it is not the whole story. */
+function tailLines(logPath: string, maxLines: number, maxChars: number): string {
+  const raw = readTail(logPath, maxChars * 3);
+  if (raw === "(no output yet)") return "";
+  const all = sanitize(raw).split("\n").filter((line) => line.trim() !== "");
+  const kept = all.slice(-maxLines);
+  const joined = kept.join("\n");
+  const body = joined.length > maxChars ? joined.slice(-maxChars) : joined;
+  const cut = raw.includes("...[truncated") || kept.length < all.length || body.length < joined.length;
+  return `${cut ? "…(earlier output omitted)\n" : ""}${body}`;
+}
+
 // ── Formatting ──────────────────────────────────────────────────────────────
 function formatDuration(ms: number): string {
   const totalSecs = Math.floor(ms / 1000);
@@ -159,12 +200,44 @@ function formatDuration(ms: number): string {
   return mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
 }
 
-function makeHeader(task: Task, exitCode: number): string {
-  const dur = formatDuration(Date.now() - task.startedAt);
-  const label = task.command.length > 60 ? task.command.slice(0, 57) + "..." : task.command;
-  const display = `"${label}"`;
-  if (exitCode === 0) return `✓ ${display} (${dur}, ${task.id})`;
-  return `✗ ${display} (${dur}, ${task.id}, exit ${exitCode})`;
+const shortCommand = (command: string): string =>
+  command.length > 60 ? `${command.slice(0, 57)}...` : command;
+
+/** Every card has the same shape: description (command, id) → tail → log → outcome last. */
+function taskCard(task: Task, opts: { tail?: string; logPath?: string; status: string }): string {
+  const lines = [`"${shortCommand(task.command)}" (${formatDuration(Date.now() - task.startedAt)}, ${task.id})`];
+  if (opts.tail) lines.push(opts.tail);
+  if (opts.logPath) lines.push(`Log: ${opts.logPath}`);
+  lines.push(opts.status);
+  return lines.join("\n");
+}
+
+/** The three ways out of a running task, repeated on every card that leaves one running. */
+function runningHints(id: string): string {
+  return [
+    `Need the result now → background_task wait ${id} (blocks; status only)`,
+    "Fine to keep going → no action; this card repeats when it finishes",
+    `Looks stuck → background_task kill ${id}`,
+  ].join("\n");
+}
+
+/** A task that just moved to the background: what it is, what it printed so far, how to leave it. */
+function backgroundCard(task: Task, logPath: string): string {
+  const tail = tailLines(logPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
+  const seconds = Math.max(1, Math.round(AUTO_BG_TIMEOUT_MS / 1000));
+  return [
+    `⟳ "${shortCommand(task.command)}" (${task.id}) — auto-backgrounded after ${seconds}s; still running; full log: ${logPath}`,
+    ...(tail ? [tail] : []),
+    runningHints(task.id),
+  ].join("\n");
+}
+
+/** A task started in the background on purpose: nothing has been printed yet. */
+function startCard(task: Task, logPath: string): string {
+  return [
+    `▶ "${shortCommand(task.command)}" (${task.id}) — running in the background; full log: ${logPath}`,
+    runningHints(task.id),
+  ].join("\n");
 }
 
 /** Suppress notification for tasks that finish very quickly (<2s) —
@@ -173,10 +246,7 @@ function shouldNotify(task: Task): boolean {
   return Date.now() - task.startedAt >= 2_000;
 }
 
-function makeFailureDetails(output: string): string {
-  const result = truncateTail(output, { maxBytes: MAX_OUTPUT_BYTES, maxLines: MAX_OUTPUT_LINES });
-  return result.content || "";
-}
+
 
 // ── Status bar ──────────────────────────────────────────────────────────────
 let sidebarLastKey: string | undefined;
@@ -282,24 +352,24 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const exitCode = Number.parseInt(await readFile(join(task.directory, "exit-code"), "utf8"), 10);
-      const output = await readFile(fileTaskOutput(task), "utf8");
       if (!Number.isInteger(exitCode)) throw new Error("invalid exit code");
 
       task.exitCode = exitCode;
       await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
 
       if (sessionStale) return;
-      const header = makeHeader(task, exitCode);
       if (shouldNotify(task) && !waitInFlight.has(task.id)) {
+        const failed = exitCode !== 0;
         pi.sendMessage(
           {
             customType: "background-bash-completion",
-            content: header,
-            details: {
-              exitCode,
-              taskId: task.id,
-              output: exitCode !== 0 ? makeFailureDetails(output) : undefined,
-            },
+            content: taskCard(task, {
+              tail: tailLines(fileTaskOutput(task), failed ? MAX_OUTPUT_LINES : CARD_TAIL_LINES,
+                failed ? MAX_OUTPUT_BYTES : CARD_TAIL_CHARS),
+              logPath: fileTaskOutput(task),
+              status: failed ? `failed (exit ${exitCode})` : "completed",
+            }),
+            details: { exitCode, taskId: task.id },
             display: true,
           },
           // Always steer, never followUp: a follow-up waits in the agent's in-memory
@@ -324,11 +394,6 @@ export default function (pi: ExtensionAPI) {
   // ── Direct task completion ───────────────────────────────────────────────
   const completeDirectTask = (task: Task, code: number | null, ui: ExtensionUIContext): void => {
     const logPath = task.logPath!;
-    let output = "(no output)";
-    try {
-      output = readTail(logPath, MAX_OUTPUT_BYTES);
-    } catch { /* best-effort */ }
-
     task.exitCode = code ?? 1;
     task.done = true;
 
@@ -339,16 +404,17 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const exitCode = code ?? 1;
-    const header = makeHeader(task, exitCode);
+    const failed = exitCode !== 0;
     pi.sendMessage(
       {
         customType: "background-bash-completion",
-        content: header,
-        details: {
-          exitCode,
-          taskId: task.id,
-          output: exitCode !== 0 ? makeFailureDetails(output) : undefined,
-        },
+        content: taskCard(task, {
+          tail: tailLines(logPath, failed ? MAX_OUTPUT_LINES : CARD_TAIL_LINES,
+            failed ? MAX_OUTPUT_BYTES : CARD_TAIL_CHARS),
+          logPath,
+          status: failed ? `failed (exit ${exitCode})` : "completed",
+        }),
+        details: { exitCode, taskId: task.id },
         display: true,
       },
       { deliverAs: "steer", triggerTurn: true },
@@ -468,10 +534,7 @@ export default function (pi: ExtensionAPI) {
     exit.then((code) => completeDirectTask(task, code, ui));
 
     return {
-      content: [{
-        type: "text",
-        text: `Auto-backgrounded as ${id} (pid ${pid}). Will notify on completion.\nCommand: ${command}\nOutput: ${logPath}`,
-      }],
+      content: [{ type: "text", text: backgroundCard(task, logPath) }],
       details: undefined,
     };
   };
@@ -488,7 +551,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   const taskSchema = Type.Object({
-    action: StringEnum(["list", "kill", "wait", "output"] as const),
+    action: StringEnum(["list", "kill", "wait"] as const),
     taskId: Type.Optional(Type.String({ description: "Task ID" })),
   });
 
@@ -544,10 +607,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         return {
-          content: [{
-            type: "text" as const,
-            text: `Started detached background task ${id} (pid ${task?.pid}). Completion will be reported automatically.`,
-          }],
+          content: [{ type: "text" as const, text: startCard(task, fileTaskOutput(task)) }],
           details: undefined,
         };
       }
@@ -561,11 +621,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "background_task",
     label: "background_task",
-    description: "List, stop, wait for, or read output of background tasks.",
-    promptSnippet: "Manage background tasks: list, kill, wait, output",
+    description: "List, stop, or wait for background tasks.",
+    promptSnippet: "Manage background tasks: list, kill, wait",
     promptGuidelines: [
       "Background tasks auto-notify on completion — don't poll. Use wait to block until a task finishes.",
-      "Completions report status only (success: no output; failure: truncated tail). Use output <id> to read the FULL log when you need the details.",
+      "Every card carries a tail of the output plus its log path; read the log with bash for the rest.",
     ],
     parameters: taskSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -621,32 +681,9 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (params.action === "output") {
-        if (!params.taskId) throw new Error("taskId is required for output.");
-        const t = tasks.get(params.taskId)
-          ?? [...tasks.values()].find(j => j.id === params.taskId || j.id.endsWith(params.taskId));
-        if (!t) throw new Error(`Unknown background task: ${params.taskId}`);
-
-        let output: string;
-        if (t.directory) {
-          const p = fileTaskOutput(t);
-          if (!existsSync(p)) return { content: [{ type: "text" as const, text: "No output yet." }], details: undefined };
-          output = (await readFile(p, "utf8")) || "(empty)";
-        } else if (t.logPath) {
-          try {
-            output = (await readFile(t.logPath, "utf8")) || "(empty)";
-          } catch {
-            return { content: [{ type: "text" as const, text: "No output yet." }], details: undefined };
-          }
-        } else {
-          return { content: [{ type: "text" as const, text: "No output available." }], details: undefined };
-        }
-        return {
-          content: [{ type: "text" as const, text: `Full output of ${t.id}:\n${output}` }],
-          details: undefined,
-        };
-      }
-
+      // Cards carry the output the model needs; the log path on each card is the way
+      // back to the rest. Fail loudly instead of falling into the kill branch.
+      if (params.action !== "kill") throw new Error(`Unsupported action: ${params.action}`);
       if (!params.taskId) throw new Error("taskId is required for kill.");
       const task = tasks.get(params.taskId);
       if (!task) throw new Error(`Unknown background task: ${params.taskId}`);
@@ -756,6 +793,9 @@ export default function (pi: ExtensionAPI) {
             "Reason (sent to agent, optional)",
           );
           if (reason === undefined) continue; // cancelled — abort kill
+          // Read the tail before killing: the log of a direct task is deleted below.
+          const killedLogPath = task.logPath ?? fileTaskOutput(task);
+          const killedTail = tailLines(killedLogPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
           if (task.directory) {
             try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
             await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
@@ -767,13 +807,16 @@ export default function (pi: ExtensionAPI) {
             tasks.delete(task.id);
           }
           renderSidebar(tasks, ui);
-          const cmdLabel = task.command.length > 60 ? task.command.slice(0, 57) + "..." : task.command;
-          const reasonSuffix = reason.trim() ? `: ${reason.trim()}` : "";
+          const trimmed = reason.trim();
           pi.sendMessage(
             {
               customType: "background-bash-completion",
-              content: `⊘ ${cmdLabel} (${task.id}) — killed by user${reasonSuffix}`,
-              details: { taskId: task.id, reason: reason.trim() || undefined },
+              content: taskCard(task, {
+                tail: killedTail,
+                logPath: killedLogPath,
+                status: trimmed ? `killed by user: ${trimmed}` : "killed by user",
+              }),
+              details: { taskId: task.id, reason: trimmed || undefined },
               display: true,
             },
             // Same reason as the completion notice: followUp can be dropped before the
@@ -832,6 +875,9 @@ if (process.env.BACKGROUND_BASH_SELF_TEST === "1") {
   if (lines.some((line) => visibleWidth(line) > 95)) {
     throw new Error("completion renderer self-check failed");
   }
+
+  const stripped = sanitize("\u001b[31mred\u001b[0m\tplain\u0007done");
+  if (stripped !== "red\tplaindone") throw new Error(`sanitize self-check failed: ${JSON.stringify(stripped)}`);
 
   if (formatDuration(0) !== "0s") throw new Error("formatDuration 0");
   if (formatDuration(5000) !== "5s") throw new Error("formatDuration 5s");

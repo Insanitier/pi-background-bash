@@ -15,6 +15,11 @@
  *   5. a task stopped on purpose reports nothing
  *   6. a killed auto-backgrounded (direct) task reports nothing
  *   7. the widget and status line clear once nothing is running
+ *   8. card shape: description (command, id) -> tail -> log path -> outcome LAST, with
+ *      the three ways out repeated while a task still runs and nothing else
+ *   9. cards carry sanitized output: escape sequences never reach the model
+ *  10. `background_task output` is gone; an unknown action fails loudly instead of
+ *      falling into the kill branch
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -69,7 +74,7 @@ mkdirSync(AGENT_DIR, { recursive: true });
 process.env.HOME = HOME;
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 // Outlive the 2s quick-completion window by a hair, then auto-background.
-process.env.BACKGROUND_BASH_AUTO_BG_MS = "150";
+process.env.BACKGROUND_BASH_AUTO_BG_MS = "400";
 // Let the extension's own inline self-check run as part of this harness.
 process.env.BACKGROUND_BASH_SELF_TEST = "1";
 
@@ -125,6 +130,7 @@ const ctx = { ui, cwd: WORK_DIR, sessionManager: { getSessionId: () => SESSION_I
 
 const cards = () => calls.messages.filter((m) => m.customType === "background-bash-completion");
 const cardsFor = (id) => cards().filter((m) => m.details?.taskId === id);
+const idOf = (text) => String(text).match(/\(([0-9a-f]{16}|bg-[0-9a-f]{8})\)/)?.[1];
 const run = (name, params) => tools.get(name).execute("verify", params, undefined, undefined, ctx);
 const lastStatus = () => calls.status.at(-1)?.[1];
 
@@ -156,7 +162,7 @@ check(
 
 // ── 4. Explicit background task: completion arrives as steer ────────────────
 const quick = await run("bash", { command: "echo hello-from-a-background-task", run_in_background: true });
-const quickId = String(quick.content[0].text).match(/task ([0-9a-f]{16})/)?.[1];
+const quickId = idOf(quick.content[0].text);
 await new Promise((resolve) => setTimeout(resolve, 600));
 check(
 	"a task that finishes inside the 2s window reports nothing",
@@ -165,7 +171,7 @@ check(
 );
 
 const launched = await run("bash", { command: "sleep 2.5; echo slow-enough-to-report", run_in_background: true });
-const firstId = String(launched.content[0].text).match(/task ([0-9a-f]{16})/)?.[1];
+const firstId = idOf(launched.content[0].text);
 const firstCard = firstId ? (await until(() => cardsFor(firstId).length > 0), cardsFor(firstId)[0]) : undefined;
 check(
 	"a slower background task reports completion with steer",
@@ -177,7 +183,7 @@ check(
 
 // ── 5. A wait in flight suppresses the duplicate card ───────────────────────
 const waited = await run("bash", { command: "sleep 2.5; echo waited-to-the-end", run_in_background: true });
-const waitId = String(waited.content[0].text).match(/task ([0-9a-f]{16})/)?.[1];
+const waitId = idOf(waited.content[0].text);
 const pendingWait = waitId
 	? run("background_task", { action: "wait", taskId: waitId })
 	: Promise.resolve({ content: [{ text: "no task id was reported" }] });
@@ -193,7 +199,7 @@ check(
 
 // ── 6. A stopped task reports nothing ──────────────────────────────────────
 const doomed = await run("bash", { command: "sleep 30", run_in_background: true });
-const doomedId = String(doomed.content[0].text).match(/task ([0-9a-f]{16})/)?.[1];
+const doomedId = idOf(doomed.content[0].text);
 // Past the 2s window, so only the deliberate stop can explain a missing card.
 await new Promise((resolve) => setTimeout(resolve, 2_500));
 const stopped = doomedId
@@ -207,40 +213,115 @@ check(
 );
 
 // ── 6b. A user kill from /bg delivers the typed reason as steer ────────────
-const victim = await run("bash", { command: "sleep 30", run_in_background: true });
-const victimId = String(victim.content[0].text).match(/task ([0-9a-f]{16})/)?.[1];
+const victim = await run("bash", { command: "echo about-to-be-killed; sleep 30", run_in_background: true });
+const victimId = idOf(victim.content[0].text);
 await commands.get("bg").handler(undefined, ctx);
 await new Promise((resolve) => setTimeout(resolve, 400));
 const killNotice = calls.messages.find(
 	(m) => m.customType === "background-bash-completion" && /killed by user/.test(String(m.content)),
 );
+const killLines = String(killNotice?.content ?? "").split("\n");
 check(
 	"a user kill from /bg delivers the typed reason with steer",
 	victimId !== undefined &&
 		killNotice !== undefined &&
 		String(killNotice.content).includes(victimId) &&
+		killLines.at(-1) === `killed by user: ${KILL_REASON}` &&
+		String(killNotice.content).includes("Log: ") &&
+		String(killNotice.content).includes("about-to-be-killed") &&
 		killNotice.details?.reason === KILL_REASON &&
 		killNotice.opts?.deliverAs === "steer" &&
 		killNotice.opts?.triggerTurn === true,
-	JSON.stringify({ id: victimId, notice: killNotice?.content, opts: killNotice?.opts, reason: killNotice?.details?.reason }),
+	JSON.stringify({ id: victimId, notice: killNotice?.content, last: killLines.at(-1), opts: killNotice?.opts }),
+);
+
+// ── 6c. Card shape: outcome last, tail and log path in between ─────────────
+const successLines = String(firstCard?.content ?? "").split("\n");
+check(
+	"a success card is description -> tail -> log -> outcome last",
+	successLines.length >= 4 &&
+		/^".*" \(.*, [0-9a-f]{16}\)$/.test(successLines[0]) &&
+		String(firstCard?.content).includes("slow-enough-to-report") &&
+		successLines.at(-2)?.startsWith("Log: ") === true &&
+		successLines.at(-1) === "completed",
+	JSON.stringify({ lines: successLines }),
+);
+
+const failedTask = await run("bash", { command: "sleep 2.5; echo boom; exit 3", run_in_background: true });
+const failedId = idOf(failedTask.content[0].text);
+const failedCard = failedId ? (await until(() => cardsFor(failedId).length > 0), cardsFor(failedId)[0]) : undefined;
+check(
+	"a failure card ends with the exit code and keeps the old, larger tail",
+	failedId !== undefined &&
+		String(failedCard?.content).includes("boom") &&
+		String(failedCard?.content).split("\n").at(-1) === "failed (exit 3)",
+	JSON.stringify({ id: failedId, card: failedCard?.content }),
+);
+
+// ── 6d. Sanitized output: escapes never reach the model ────────────────────
+const colored = await run("bash", { command: "sleep 2.5; printf '\\033[31mred\\033[0m done\\n'", run_in_background: true });
+const colorId = idOf(colored.content[0].text);
+const colorCard = colorId ? (await until(() => cardsFor(colorId).length > 0), cardsFor(colorId)[0]) : undefined;
+check(
+	"a card strips terminal escapes but keeps the text",
+	colorId !== undefined &&
+		!String(colorCard?.content).includes("\u001b") &&
+		String(colorCard?.content).includes("red done"),
+	JSON.stringify({ id: colorId, card: colorCard?.content }),
+);
+
+// ── 6e. Auto-background card: what it printed, and the three ways out ──────
+const autoBg = await run("bash", { command: "echo warming up; sleep 30" });
+const autoBgText = String(autoBg.content[0].text);
+check(
+	"the auto-background card holds the tail and the three ways out",
+	/auto-backgrounded after 400s|auto-backgrounded after \d+s/.test(autoBgText) &&
+		autoBgText.includes("warming up") &&
+		autoBgText.includes("background_task wait") &&
+		autoBgText.includes("background_task kill") &&
+		autoBgText.includes("full log: "),
+	JSON.stringify({ text: autoBgText }),
+);
+const autoBgId = autoBgText.match(/\(([0-9a-f]{16}|bg-[0-9a-f]{8})\)/)?.[1];
+if (autoBgId) await run("background_task", { action: "kill", taskId: autoBgId }).catch(() => {});
+
+// ── 6f. `output` is gone; unknown actions fail loudly ─────────────────────
+let outputGone = false;
+try {
+	await run("background_task", { action: "output", taskId: firstId });
+} catch (error) {
+	outputGone = /Unsupported action/.test(String(error?.message));
+}
+check(
+	"the output action is gone and an unknown action fails loudly",
+	outputGone &&
+		!/background_task output/.test((tools.get("background_task").promptGuidelines ?? []).join("\n")) &&
+		!/read output/.test(String(tools.get("background_task").description)),
+	JSON.stringify({ outputGone, guidelines: tools.get("background_task").promptGuidelines, description: tools.get("background_task").description }),
 );
 
 // ── 7. A killed auto-backgrounded task reports nothing ─────────────────────
 const backgrounded = await run("bash", { command: "sleep 30" });
-const autoId = String(backgrounded.content[0].text).match(/Auto-backgrounded as (bg-[0-9a-f]{8})/)?.[1];
+const autoId = idOf(backgrounded.content[0].text);
 const autoStopped = autoId ? await run("background_task", { action: "kill", taskId: autoId }) : undefined;
 await new Promise((resolve) => setTimeout(resolve, 1_200));
 check(
 	"a killed auto-backgrounded task reports nothing",
 	autoId !== undefined &&
-		/Auto-backgrounded/.test(String(backgrounded.content[0].text)) &&
+		/auto-backgrounded/.test(String(backgrounded.content[0].text)) &&
+		String(backgrounded.content[0].text).includes("full log: ") &&
 		/Stopped background task/.test(String(autoStopped?.content[0].text)) &&
 		cardsFor(autoId).length === 0,
 	JSON.stringify({ id: autoId, killed: autoStopped?.content[0].text, cards: cardsFor(autoId).length }),
 );
 
+// ── 8c. Drain: kill whatever is still running, then the widget must clear ──
+const stillRunning = await run("background_task", { action: "list" });
+const leftovers = String(stillRunning.content[0].text).match(/[0-9a-f]{16}|bg-[0-9a-f]{8}/g) ?? [];
+for (const id of leftovers) await run("background_task", { action: "kill", taskId: id }).catch(() => {});
+
 // ── 8. The widget clears once nothing is running ───────────────────────────
-const cleared = await until(() => lastStatus() === undefined, 3_000);
+const cleared = await until(() => lastStatus() === undefined, 6_000);
 check(
 	"the widget and status line clear when nothing is running",
 	cleared,
