@@ -35,4 +35,14 @@ Escape during a `wait` returns that wait cancelled and still leaves the completi
 
 A completion notice rides along with the current turn (`steer`) rather than ending it, and every background task reports its outcome however quickly it finished. Only a `wait` that actually saw the task end suppresses the card, because that wait's own result already carries the outcome. Work a command detaches by hand (`nohup`, `setsid`, a trailing `&`) is deliberately outside all of this: keep long work in the submitted shell's foreground, or let `run_in_background` detach the tool.
 
+## uv mode
+
+Set `BACKGROUND_BASH_UV=1` to route Python tooling through [uv](https://docs.astral.sh/uv/), absorbing the interception design from [mitsuhiko/agent-stuff's uv extension](https://github.com/mitsuhiko/agent-stuff):
+
+- `pip`, `pip3`, `poetry` and `python -m pip|venv|py_compile` are refused, with the uv equivalent in the error — explicit interpreter paths (`.venv/bin/python -m pip`) included, which a PATH shim alone cannot see.
+- `python` and `python3` run through `uv run`, so they work even where no interpreter is on `PATH`.
+- Nothing else is touched: the shim directory is only prepended to `PATH` inside the spawned shell.
+
+It is off by default; without the variable the tool behaves exactly as before.
+
 `npm test` runs the regression net (`verify.mjs`): module load, the background guidance, the card shape and ordering, sanitized tails, the completion rules above, deliberate stops, and the widget clearing.

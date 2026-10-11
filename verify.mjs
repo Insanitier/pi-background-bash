@@ -29,6 +29,9 @@
  *      and aborting a wait — the latter must hand the task back to the completion card
  *  15. aborting a foreground command kills it (SIGKILL to its process group, the way the
  *      built-in bash tool does) instead of letting it run to completion
+ *  16. uv mode (BACKGROUND_BASH_UV=1): pip and friends are refused with the uv equivalent,
+ *      explicit interpreter paths included, python3 runs through uv, and other commands
+ *      are untouched
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -86,6 +89,8 @@ process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 process.env.BACKGROUND_BASH_AUTO_BG_MS = "400";
 // Let the extension's own inline self-check run as part of this harness.
 process.env.BACKGROUND_BASH_SELF_TEST = "1";
+// Exercise the uv interception for the whole run; the extension defaults it to off.
+process.env.BACKGROUND_BASH_UV = "1";
 
 const SESSION_ID = `verify-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
 const WORK_DIR = join(HOME, "work");
@@ -175,6 +180,43 @@ check(
 		/until loop/.test(guidance) &&
 		/background_task/.test(guidance) &&
 		!/no[hu]up|setsid|disown/i.test(guidance),
+);
+
+// ── 3b. uv mode: Python tooling intercepted, everything else untouched ─────
+const uvFailure = async (command) => {
+	try {
+		await run("bash", { command });
+		return undefined;
+	} catch (error) {
+		return String(error?.message);
+	}
+};
+const pipError = await uvFailure("pip install requests");
+const explicitPathError = await uvFailure(".venv/bin/python -m pip install requests");
+const plainCommand = await run("bash", { command: "echo plain-command-fine" });
+check(
+	"uv mode refuses pip with uv guidance, explicit interpreter paths included",
+	/Use uv instead/.test(String(pipError)) &&
+		/Use uv instead/.test(String(explicitPathError)) &&
+		String(plainCommand.content[0].text).includes("plain-command-fine"),
+	JSON.stringify({ pipError, explicitPathError, plain: plainCommand.content[0].text }),
+);
+
+const hasUv = (() => {
+	try {
+		execFileSync("which", ["uv"], { stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+})();
+const shimDir = join(tmpdir(), "pi-background-bash", "shims");
+const redirected = await run("bash", { command: "python3 -c 'import sys; print(\"interpreter:\", sys.executable)'" });
+const redirectedText = String(redirected.content[0].text);
+check(
+	"uv mode runs python3 through uv instead of the shim",
+	!hasUv || (redirectedText.includes("interpreter:") && !redirectedText.includes(shimDir)),
+	JSON.stringify({ hasUv, redirected: redirectedText.slice(0, 240) }),
 );
 
 // ── 4. Explicit background task: completion arrives as steer ────────────────

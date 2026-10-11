@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { openSync, closeSync, fstatSync, readSync, unlinkSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -26,6 +26,12 @@ const AUTO_BG_TIMEOUT_MS = Number(process.env.BACKGROUND_BASH_AUTO_BG_MS ?? 120_
 const QUICK_COMPLETION_MS = 2_000;
 const FOREGROUND_TAIL_BYTES = 4_096;
 const PREVIEW_CHARS = 40;
+// uv mode: intercept Python tooling the way mitsuhiko/agent-stuff's uv extension does —
+// a PATH shim for anything the model types, plus a spawn-time check for explicit paths
+// (`.venv/bin/python -m pip`) that a PATH shim cannot see. Opt-in: nothing here fires
+// unless BACKGROUND_BASH_UV=1, so a machine without uv is unaffected.
+const UV_MODE = process.env.BACKGROUND_BASH_UV === "1";
+const SHIM_DIR = join(ROOT_DIR, "shims");
 
 // ── Types ──────────────────────────────────────────────────────────────────
 type Task = {
@@ -56,9 +62,12 @@ function spawnWithFileOutput(command: string, cwd: string, logPath: string): {
 } {
   mkdirSync(dirname(logPath), { recursive: true });
   const fd = openSync(logPath, "w");
+  // The single spawn exit, so uv mode covers the foreground and the explicit background
+  // path alike. The card still shows the command the model asked for, not this prefix.
+  const shellCommand = UV_MODE ? `export PATH=${JSON.stringify(SHIM_DIR)}:"$PATH"\n${command}` : command;
   let proc: ChildProcess;
   try {
-    proc = spawn("bash", ["-c", command], {
+    proc = spawn("bash", ["-c", shellCommand], {
       stdio: ["ignore", fd, fd],
       cwd,
       detached: true,
@@ -94,6 +103,107 @@ function killTree(pid: number): void {
 /** What a killed foreground command reports: the tail it managed to print, then where the rest is. */
 function abortMessage(tail: string, logPath: string): string {
   return ["Command aborted.", tail.trim(), `Log: ${logPath}`].filter(Boolean).join("\n");
+}
+
+/** Python tooling uv replaces, refused before anything is spawned. Mirrors the checks in
+ *  mitsuhiko/agent-stuff's uv extension, including explicit interpreter paths. */
+function uvBlockedMessage(command: string): string | null {
+  const at = String.raw`(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?`;
+  const python = String.raw`python(?:3(?:\.\d+)?)?\b[^\n;|&]*`;
+  const pip = (name: string): string => [
+    `Error: ${name} is disabled. Use uv instead:`,
+    "",
+    "  To install a package for a script: uv run --with PACKAGE python script.py",
+    "  To add a dependency to the project: uv add PACKAGE",
+  ].join("\n");
+  const rules: Array<[RegExp, string]> = [
+    [new RegExp(`${at}pip\\s*(?:$|\\s)`, "m"), pip("pip")],
+    [new RegExp(`${at}pip3\\s*(?:$|\\s)`, "m"), pip("pip3")],
+    [new RegExp(`${at}poetry\\s*(?:$|\\s)`, "m"), [
+      "Error: poetry is disabled. Use uv instead:",
+      "",
+      "  To initialize a project: uv init",
+      "  To add a dependency: uv add PACKAGE",
+      "  To sync dependencies: uv sync",
+      "  To run commands: uv run COMMAND",
+    ].join("\n")],
+    [new RegExp(`${at}${python}(?:\\s-m\\s*pip\\b|\\s-mpip\\b)`, "m"), pip("'python -m pip'")],
+    [new RegExp(`${at}${python}(?:\\s-m\\s*venv\\b|\\s-mvenv\\b)`, "m"), [
+      "Error: 'python -m venv' is disabled. Use uv instead:",
+      "",
+      "  To create a virtual environment: uv venv",
+    ].join("\n")],
+    [new RegExp(`${at}${python}(?:\\s-m\\s*py_compile\\b|\\s-mpy_compile\\b)`, "m"), [
+      "Error: 'python -m py_compile' is disabled because it writes .pyc files to __pycache__.",
+      "",
+      "  To verify syntax without bytecode output: uv run python -m ast path/to/file.py >/dev/null",
+    ].join("\n")],
+  ];
+  for (const [pattern, message] of rules) if (pattern.test(command)) return message;
+  return null;
+}
+
+/** The shim scripts, written once into SHIM_DIR. PATH interception is what makes the
+ *  redirect robust: `xargs python3`, a pipeline, a nested `bash -c` all hit the shim. */
+function shimScripts(): Record<string, string> {
+  const refuse = (title: string, lines: string[]): string =>
+    `#!/usr/bin/env bash\n` +
+    `echo "Error: ${title} is disabled. Use uv instead:" >&2\n` +
+    lines.map((line) => `echo "  ${line}" >&2\n`).join("") +
+    "exit 1\n";
+  const interpreter = (name: string): string => `#!/usr/bin/env bash
+# Run the real interpreter through uv, skipping this shim directory when resolving it.
+shim_dir="$(cd "$(dirname "$0")" && pwd)"
+real=""
+while IFS= read -r candidate; do
+  [ -n "$candidate" ] || continue
+  [ "$(cd "$(dirname "$candidate")" && pwd)" = "$shim_dir" ] && continue
+  real="$candidate"
+  break
+done < <(type -aP python3 2>/dev/null || type -aP python 2>/dev/null)
+# Redirect through uv; without uv, fall back to the interpreter so nothing gets worse.
+if command -v uv >/dev/null 2>&1; then
+  if [ -n "$real" ]; then
+    exec uv run --python "$real" python "$@"
+  fi
+  exec uv run python "$@"
+fi
+if [ -n "$real" ]; then
+  exec "$real" "$@"
+fi
+echo "Error: neither uv nor a real ${name} interpreter was found on PATH." >&2
+exit 1
+`;
+  return {
+    pip: refuse("pip", [
+      "To install a package for a script: uv run --with PACKAGE python script.py",
+      "To add a dependency to the project: uv add PACKAGE",
+    ]),
+    pip3: refuse("pip3", [
+      "To install a package for a script: uv run --with PACKAGE python script.py",
+      "To add a dependency to the project: uv add PACKAGE",
+    ]),
+    poetry: refuse("poetry", [
+      "To initialize a project: uv init",
+      "To add a dependency: uv add PACKAGE",
+      "To sync dependencies: uv sync",
+      "To run commands: uv run COMMAND",
+    ]),
+    python: interpreter("python"),
+    python3: interpreter("python3"),
+  };
+}
+
+let shimsReady = false;
+async function ensureShims(): Promise<void> {
+  if (shimsReady) return;
+  mkdirSync(SHIM_DIR, { recursive: true });
+  // Always rewrite: skipping existing files would freeze the first version ever written,
+  // so a shim fix in a later release would never take effect.
+  for (const [name, body] of Object.entries(shimScripts())) {
+    await writeFile(join(SHIM_DIR, name), body, { mode: 0o755 });
+  }
+  shimsReady = true;
 }
 
 // ── Output reading ─────────────────────────────────────────────────────────
@@ -480,6 +590,12 @@ export default function (pi: ExtensionAPI) {
       const p = params as { command: string; run_in_background?: boolean; description?: string };
       const ui = ctx.ui;
 
+      if (UV_MODE) {
+        await ensureShims();
+        const blocked = uvBlockedMessage(p.command);
+        if (blocked) throw new Error(blocked);
+      }
+
       if (p.run_in_background) {
         // Explicit background: the same detached-process shape as the auto-background
         // path, only the log lives under this session's log directory.
@@ -740,6 +856,15 @@ if (process.env.BACKGROUND_BASH_SELF_TEST === "1") {
 
   const stripped = sanitize("\u001b[31mred\u001b[0m\tplain\u0007done");
   if (stripped !== "red\tplaindone") throw new Error(`sanitize self-check failed: ${JSON.stringify(stripped)}`);
+
+  if (uvBlockedMessage("echo hi") !== null) throw new Error("uv self-check: plain command blocked");
+  if (uvBlockedMessage("pip install requests") === null) throw new Error("uv self-check: pip not blocked");
+  if (uvBlockedMessage(".venv/bin/python -m pip install requests") === null) {
+    throw new Error("uv self-check: explicit interpreter path not blocked");
+  }
+  if (uvBlockedMessage("python3 train.py --epochs 6") !== null) {
+    throw new Error("uv self-check: a plain python3 run must be redirected, not blocked");
+  }
 
   if (formatDuration(0) !== "0s") throw new Error("formatDuration 0");
   if (formatDuration(5000) !== "5s") throw new Error("formatDuration 5s");
