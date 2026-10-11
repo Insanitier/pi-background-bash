@@ -27,6 +27,8 @@
  *      directory, and shutdown kills the lot — nothing is restored on the next start
  *  14. the wait paths the model can actually hit: waiting on a task that already finished,
  *      and aborting a wait — the latter must hand the task back to the completion card
+ *  15. aborting a foreground command kills it (SIGKILL to its process group, the way the
+ *      built-in bash tool does) instead of letting it run to completion
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -138,6 +140,13 @@ const ctx = { ui, cwd: WORK_DIR, sessionManager: { getSessionId: () => SESSION_I
 
 const cards = () => calls.messages.filter((m) => m.customType === "background-bash-completion");
 const cardsFor = (id) => cards().filter((m) => m.details?.taskId === id);
+const isAlivePid = (pid) => {
+	try {
+		return !readFileSync(`/proc/${pid}/stat`, "utf-8").split(" ")[2].startsWith("Z");
+	} catch {
+		return false;
+	}
+};
 const idOf = (text) => String(text).match(/\(([0-9a-f]{16}|bg-[0-9a-f]{8})\)/)?.[1];
 const run = (name, params, signal) => tools.get(name).execute("verify", params, signal, undefined, ctx);
 const lastStatus = () => calls.status.at(-1)?.[1];
@@ -279,6 +288,37 @@ check(
 		cardsFor(cancelId).length === 1 &&
 		String(cancelCard?.content).split("\n").at(-1) === "completed",
 	JSON.stringify({ id: cancelId, wait: cancelledText, cards: cardsFor(cancelId).length, card: cancelCard?.content }),
+);
+
+// ── 5e. Escape on a foreground command kills it (built-in bash parity) ─────
+const fgPidFile = join(HOME, "foreground-pid");
+const fgController = new AbortController();
+const pendingForeground = run("bash", { command: `echo $$ > ${fgPidFile}; sleep 30` }, fgController.signal);
+const fgPid = (await until(() => {
+	try {
+		return readFileSync(fgPidFile, "utf-8").trim().length > 0;
+	} catch {
+		return false;
+	}
+}, 4_000))
+	? Number(readFileSync(fgPidFile, "utf-8").trim())
+	: 0;
+const fgWasAlive = fgPid > 0 && isAlivePid(fgPid);
+// Still inside the 2s quick-completion window, so the abort lands where the tool would
+// otherwise keep polling.
+await new Promise((resolve) => setTimeout(resolve, 1_200));
+fgController.abort();
+let fgError;
+try {
+	await pendingForeground;
+} catch (error) {
+	fgError = error;
+}
+await until(() => fgPid > 0 && !isAlivePid(fgPid), 3_000);
+check(
+	"aborting a foreground command kills it and reports Command aborted",
+	fgWasAlive && /Command aborted/.test(String(fgError?.message)) && !isAlivePid(fgPid),
+	JSON.stringify({ pid: fgPid, alive: isAlivePid(fgPid), error: String(fgError?.message).slice(0, 160) }),
 );
 
 // ── 6. A stopped task reports nothing ──────────────────────────────────────
@@ -473,20 +513,13 @@ const pids = await until(() => {
 }, 3_000)
 	? readFileSync(pidFile, "utf-8").trim().split("\n").filter(Boolean).map(Number)
 	: [];
-const isAlive = (pid) => {
-	try {
-		return !readFileSync(`/proc/${pid}/stat`, "utf-8").split(" ")[2].startsWith("Z");
-	} catch {
-		return false;
-	}
-};
-const bothAlive = pids.length === 2 && pids.every(isAlive);
+const bothAlive = pids.length === 2 && pids.every(isAlivePid);
 await handlers.get("session_shutdown")();
 await new Promise((resolve) => setTimeout(resolve, 1_000));
 check(
 	"shutdown kills every task of this session, explicit and auto-backgrounded alike",
-	bothAlive && pids.every((pid) => !isAlive(pid)),
-	JSON.stringify({ pids, bothAlive, alive: pids.map(isAlive) }),
+	bothAlive && pids.every((pid) => !isAlivePid(pid)),
+	JSON.stringify({ pids, bothAlive, alive: pids.map(isAlivePid) }),
 );
 
 // ── 9. Cleanup ─────────────────────────────────────────────────────────────

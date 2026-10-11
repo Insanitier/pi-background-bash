@@ -25,7 +25,7 @@ completed
 Tails are sanitized (escape sequences and control characters are stripped) and capped at 2 KB / 20 lines for success and user-killed tasks, and at 32 KB / 200 lines for failures. The model reads the log with `bash` when it needs more than the tail.
 
 
-Foreground `bash` calls return the last 4 KB once the command exits within 2s; longer calls stream progress and auto-background after 120s.
+Foreground `bash` calls return the last 4 KB once the command exits within 2s; longer calls stream progress and auto-background after 120s. Escape while one runs kills it — SIGKILL to its process group, the same as the built-in `bash` tool — and reports `Command aborted.` with the tail it printed and its log path (that log is kept, unlike the one from a command that finished).
 
 There is one kind of task, not two: an explicit `run_in_background` and a 120s auto-background both end up as a single detached process with a single log at `/tmp/pi-background-bash/<session>/<id>.log`. Exiting Pi kills the tasks that session started — nothing is restored on the next start — and their log files are all that is left. A long job that must outlive Pi belongs in whatever submits it remotely (an `ssh` job), not in this extension.
 

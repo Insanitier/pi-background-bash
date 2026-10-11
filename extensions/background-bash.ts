@@ -81,6 +81,21 @@ function spawnWithFileOutput(command: string, cwd: string, logPath: string): {
   return { proc, pid: proc.pid, exit };
 }
 
+/** Kill a task's whole process group, the way the built-in bash tool does on abort.
+ *  SIGKILL, not SIGTERM: an interrupted foreground command is meant to be gone now. */
+function killTree(pid: number): void {
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+}
+
+/** What a killed foreground command reports: the tail it managed to print, then where the rest is. */
+function abortMessage(tail: string, logPath: string): string {
+  return ["Command aborted.", tail.trim(), `Log: ${logPath}`].filter(Boolean).join("\n");
+}
+
 // ── Output reading ─────────────────────────────────────────────────────────
 function readTail(logPath: string, maxChars: number): string {
   let fd: number;
@@ -312,8 +327,11 @@ export default function (pi: ExtensionAPI) {
     ui: ExtensionUIContext,
     cwd: string,
     logDirPath: string,
+    signal: AbortSignal | undefined,
     onUpdate?: (update: { content: { type: "text"; text: string }[]; details: undefined }) => void,
   ): Promise<{ content: { type: "text"; text: string }[]; details?: undefined }> => {
+    if (signal?.aborted) throw new Error("Command aborted.");
+
     const id = `bg-${randomBytes(4).toString("hex")}`;
     const logPath = join(logDirPath, `${id}.log`);
 
@@ -323,16 +341,42 @@ export default function (pi: ExtensionAPI) {
     tasks.set(id, task);
     renderSidebar(tasks, ui);
 
+    // Escape during a foreground command kills it, like the built-in bash tool. Both races
+    // below carry the same arm, so either window aborts through this one path.
+    let stopListening = (): void => { /* no signal, nothing to remove */ };
+    const aborted = new Promise<{ source: "abort" }>((resolve) => {
+      if (!signal) return; // an arm that never settles
+      const onAbort = (): void => {
+        killTree(pid);
+        resolve({ source: "abort" });
+      };
+      if (signal.aborted) onAbort();
+      else {
+        signal.addEventListener("abort", onAbort, { once: true });
+        stopListening = () => signal.removeEventListener("abort", onAbort);
+      }
+    });
+    const finishAborted = (): never => {
+      stopListening();
+      tasks.delete(id);
+      renderSidebar(tasks, ui);
+      throw new Error(abortMessage(readTail(logPath, FOREGROUND_TAIL_BYTES), logPath));
+    };
+
     // Quick completion window (2s)
     const quickResult = await Promise.race([
       exit.then((code) => ({ source: "exit" as const, code })),
+      aborted,
       new Promise<{ source: "timeout" }>((r) => {
         const t = setTimeout(() => r({ source: "timeout" }), QUICK_COMPLETION_MS);
         t.unref();
       }),
     ]);
 
+    if (quickResult.source === "abort") finishAborted();
+
     if (quickResult.source === "exit") {
+      stopListening();
       tasks.delete(id);
       renderSidebar(tasks, ui);
       const output = readTail(logPath, FOREGROUND_TAIL_BYTES);
@@ -365,6 +409,7 @@ export default function (pi: ExtensionAPI) {
     // Race: completion vs auto-background timeout
     const raceResult = await Promise.race([
       exit.then((code) => ({ source: "exit" as const, code })),
+      aborted,
       new Promise<{ source: "timeout" }>((r) => {
         const t = setTimeout(() => r({ source: "timeout" }), AUTO_BG_TIMEOUT_MS);
         t.unref();
@@ -373,7 +418,10 @@ export default function (pi: ExtensionAPI) {
 
     if (pollTimer) clearInterval(pollTimer);
 
+    if (raceResult.source === "abort") finishAborted();
+
     if (raceResult.source === "exit") {
+      stopListening();
       tasks.delete(id);
       renderSidebar(tasks, ui);
       const output = readTail(logPath, FOREGROUND_TAIL_BYTES);
@@ -385,6 +433,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Auto-background: detach process, notify on completion
+    stopListening();
     proc.unref();
     exit.then((code) => completeDirectTask(task, code, ui));
 
@@ -453,7 +502,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Foreground with auto-background
-      return runForeground(p.command, ui, ctx.cwd, logDir(ctx.sessionManager.getSessionId()), onUpdate);
+      return runForeground(p.command, ui, ctx.cwd, logDir(ctx.sessionManager.getSessionId()), signal, onUpdate);
     },
   });
 
