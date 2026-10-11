@@ -23,6 +23,8 @@
  *  11. a bounded wait hands back a snapshot (status + tail + log path) and leaves the task
  *      alone; a wait that timed out does NOT swallow the completion card
  *  12. the log of a task killed on purpose survives, so the path on its card stays valid
+ *  13. one representation: every task is a detached process with a log under the session
+ *      directory, and shutdown kills the lot — nothing is restored on the next start
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -33,7 +35,7 @@
  * Run it with `node verify.mjs` (or `npm test`); it takes a few seconds.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -82,7 +84,6 @@ process.env.BACKGROUND_BASH_AUTO_BG_MS = "400";
 process.env.BACKGROUND_BASH_SELF_TEST = "1";
 
 const SESSION_ID = `verify-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
-const STARTED_AT = Date.now();
 const WORK_DIR = join(HOME, "work");
 mkdirSync(WORK_DIR, { recursive: true });
 const TASK_ROOT = join(tmpdir(), "pi-background-bash", Buffer.from(SESSION_ID).toString("base64url"));
@@ -123,11 +124,12 @@ const ui = {
 	input: async () => KILL_REASON,
 	editor: async () => {},
 };
+const handlers = new Map();
 const pi = {
 	registerTool: (def) => tools.set(def.name, def),
 	registerMessageRenderer: () => {},
 	registerCommand: (name, def) => commands.set(name, def),
-	on: () => {},
+	on: (event, handler) => handlers.set(event, handler),
 	sendMessage: (message, opts) => calls.messages.push({ ...message, opts }),
 };
 const ctx = { ui, cwd: WORK_DIR, sessionManager: { getSessionId: () => SESSION_ID } };
@@ -388,18 +390,42 @@ check(
 	JSON.stringify(calls.messages.map((m) => m.opts)),
 );
 
+// ── 8d. Shutdown kills what this session started, both kinds alike ─────────
+// Both tasks write their own pid, so the check does not depend on how the shell
+// rewrites its command line (a trailing `# marker` comment gets stripped by exec).
+const pidFile = join(HOME, "shutdown-pids");
+const pidCommand = `echo $$ >> ${pidFile}; sleep 30`;
+await run("bash", { command: pidCommand, run_in_background: true });
+await run("bash", { command: pidCommand });
+const pids = await until(() => {
+	try {
+		return readFileSync(pidFile, "utf-8").trim().split("\n").filter(Boolean).length >= 2;
+	} catch {
+		return false;
+	}
+}, 3_000)
+	? readFileSync(pidFile, "utf-8").trim().split("\n").filter(Boolean).map(Number)
+	: [];
+const isAlive = (pid) => {
+	try {
+		return !readFileSync(`/proc/${pid}/stat`, "utf-8").split(" ")[2].startsWith("Z");
+	} catch {
+		return false;
+	}
+};
+const bothAlive = pids.length === 2 && pids.every(isAlive);
+await handlers.get("session_shutdown")();
+await new Promise((resolve) => setTimeout(resolve, 1_000));
+check(
+	"shutdown kills every task of this session, explicit and auto-backgrounded alike",
+	bothAlive && pids.every((pid) => !isAlive(pid)),
+	JSON.stringify({ pids, bothAlive, alive: pids.map(isAlive) }),
+);
+
 // ── 9. Cleanup ─────────────────────────────────────────────────────────────
 rmSync(TASK_ROOT, { recursive: true, force: true });
-// Only the logs this run created: /tmp/pi-bg is shared with every other Pi session.
-const sharedLogDir = join(tmpdir(), "pi-bg");
-if (existsSync(sharedLogDir)) {
-	for (const entry of readdirSync(sharedLogDir)) {
-		const path = join(sharedLogDir, entry);
-		try {
-			if (statSync(path).mtimeMs >= STARTED_AT - 1_000) rmSync(path, { force: true });
-		} catch { /* best-effort */ }
-	}
-}
+// Every log lives under TASK_ROOT, so this one rmSync is the whole cleanup: no shared
+// directory is touched, unlike the version that used to wipe /tmp/pi-bg for every session.
 rmSync(HOME, { recursive: true, force: true });
 
 const failed = checks.filter(([, ok]) => !ok);

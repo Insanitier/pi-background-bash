@@ -18,14 +18,16 @@ Every card has the same shape — description (command, task ID), a bounded tail
 "sleep 30; echo ready" (1m02s, 48c840e0001f2d19)
 Epoch 1/6  loss=2.31
 Epoch 2/6  loss=1.98
-Log: /tmp/pi-background-bash/<session>/48c840e0001f2d19/output.log
+Log: /tmp/pi-background-bash/<session>/48c840e0001f2d19.log
 completed
 ```
 
 Tails are sanitized (escape sequences and control characters are stripped) and capped at 2 KB / 20 lines for success and user-killed tasks, and at 32 KB / 200 lines for failures. The model reads the log with `bash` when it needs more than the tail.
 
 
-Foreground `bash` calls return the last 4 KB once the command exits within 2s; longer calls stream progress and auto-background after 120s. Explicit `run_in_background` tasks keep their log in `/tmp/pi-background-bash/<session>/<id>/output.log`; auto-backgrounded ones in `/tmp/pi-bg/<id>.log`.
+Foreground `bash` calls return the last 4 KB once the command exits within 2s; longer calls stream progress and auto-background after 120s.
+
+There is one kind of task, not two: an explicit `run_in_background` and a 120s auto-background both end up as a single detached process with a single log at `/tmp/pi-background-bash/<session>/<id>.log`. Exiting Pi kills the tasks that session started — nothing is restored on the next start — and their log files are all that is left. A long job that must outlive Pi belongs in whatever submits it remotely (an `ssh` job), not in this extension.
 
 A card that leaves a task running — the 120s auto-background, or an explicit `run_in_background` — ends with the three decisions that are actually open: does the next step depend on this result (`wait`), do you need a progress check (`wait 0` or read the log), and is there evidence the task is wrong or unwanted (`kill`)? A quiet log is not evidence of a hung job, so nothing pushes you towards killing one.
 

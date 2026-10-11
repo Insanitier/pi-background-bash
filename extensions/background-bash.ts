@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, type FSWatcher, watch as watchSync } from "node:fs";
-import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { openSync, closeSync, fstatSync, readSync, unlinkSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -12,7 +12,6 @@ import { Type } from "typebox";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const ROOT_DIR = join(tmpdir(), "pi-background-bash");
-const LOG_DIR = "/tmp/pi-bg";
 // Failure cards keep the old, larger tail; every other card is deliberately small.
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_LINES = 200;
@@ -36,68 +35,18 @@ type Task = {
   startedAt: number;
   cwd: string;
   exitCode?: number;
-  // File-based task fields (explicit background via runner.sh)
-  directory?: string;
-  watcher?: FSWatcher;
-  reporting?: boolean;
-  // Direct spawn fields (auto-backgrounded)
-  proc?: ChildProcess;
-  logPath?: string;
-  exit?: Promise<number | null>;
+  proc: ChildProcess;
+  logPath: string;
+  exit: Promise<number | null>;
   done?: boolean; // marked when completed
   cancelled?: boolean; // stopped on purpose: it must not also report completion
 };
 
-// ── File helpers (explicit background via runner.sh) ───────────────────────
-const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\"'\"'")}'`;
-
-const taskRoot = (sessionId: string): string =>
+/** One directory per session, holding one log file per task. Keyed by session so two Pi
+ *  sessions never share a path. Nothing is restored from it: a task's process is killed on
+ *  shutdown, so after a reload its log file is all that is left. */
+const logDir = (sessionId: string): string =>
   join(ROOT_DIR, Buffer.from(sessionId).toString("base64url"));
-
-const taskPath = (sessionId: string, taskId: string): string => join(taskRoot(sessionId), taskId);
-
-const fileTaskOutput = (task: Task): string => join(task.directory!, "output.log");
-
-/** Where a task's output lives, whichever of the two representations it uses. */
-const logPathOf = (task: Task): string => task.logPath ?? fileTaskOutput(task);
-
-const isFileTaskDone = (task: Task): boolean => {
-  if (!task.directory) return false;
-  if (existsSync(join(task.directory, "reported"))) return true;
-  if (existsSync(join(task.directory, "cancelled"))) return true;
-  return existsSync(join(task.directory, "done"));
-};
-
-async function ensureDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  await chmod(path, 0o700);
-}
-
-async function writeTaskFiles(taskDirectory: string, command: string): Promise<void> {
-  const commandPath = join(taskDirectory, "command.sh");
-  const outputPath = join(taskDirectory, "output.log");
-  const exitCodePath = join(taskDirectory, "exit-code");
-  const exitCodeTemporaryPath = `${exitCodePath}.tmp`;
-  const donePath = join(taskDirectory, "done");
-  const doneTemporaryPath = `${donePath}.tmp`;
-  const runnerPath = join(taskDirectory, "runner.sh");
-
-  await writeFile(commandPath, command, { mode: 0o700 });
-  await writeFile(
-    runnerPath,
-    `#!/usr/bin/env bash
-set +e
-/bin/bash ${shellQuote(commandPath)} >${shellQuote(outputPath)} 2>&1
-status=$?
-printf '%s\n' "$status" >${shellQuote(exitCodeTemporaryPath)}
-mv ${shellQuote(exitCodeTemporaryPath)} ${shellQuote(exitCodePath)}
-: >${shellQuote(doneTemporaryPath)}
-mv ${shellQuote(doneTemporaryPath)} ${shellQuote(donePath)}
-exit "$status"
-`,
-    { mode: 0o700 },
-  );
-}
 
 // ── Direct spawn helper ────────────────────────────────────────────────────
 function spawnWithFileOutput(command: string, cwd: string, logPath: string): {
@@ -260,12 +209,7 @@ function renderSidebar(tasks: Map<string, Task>, ui: ExtensionUIContext): void {
   let doneCount = 0;
   let failCount = 0;
   for (const task of tasks.values()) {
-    if (task.directory) {
-      if (isFileTaskDone(task)) {
-        if (task.exitCode !== undefined && task.exitCode !== 0) failCount++;
-        else doneCount++;
-      } else running.push(task);
-    } else if (task.done) {
+    if (task.done) {
       if (task.exitCode !== undefined && task.exitCode !== 0) failCount++;
       else doneCount++;
     } else {
@@ -331,72 +275,9 @@ export default function (pi: ExtensionAPI) {
   // to the model itself, so a completion card for it would only repeat it.
   const waitInFlight = new Set<string>();
 
-  // ── File-based task lifecycle ────────────────────────────────────────────
-  const stopWatching = (task: Task): void => {
-    task.watcher?.close();
-    task.watcher = undefined;
-  };
-
-  const completeFileTask = async (task: Task, ui: ExtensionUIContext): Promise<void> => {
-    if (task.reporting || !task.directory) return;
-    const done = existsSync(join(task.directory, "done"));
-    const cancelled = existsSync(join(task.directory, "cancelled"));
-    if (!done && !cancelled) return;
-
-    if (cancelled) {
-      task.reporting = true;
-      stopWatching(task);
-      renderSidebar(tasks, ui);
-      return;
-    }
-
-    task.reporting = true;
-    stopWatching(task);
-
-    try {
-      const exitCode = Number.parseInt(await readFile(join(task.directory, "exit-code"), "utf8"), 10);
-      if (!Number.isInteger(exitCode)) throw new Error("invalid exit code");
-
-      task.exitCode = exitCode;
-      await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
-
-      if (sessionStale) return;
-      if (!waitInFlight.has(task.id)) {
-        const failed = exitCode !== 0;
-        pi.sendMessage(
-          {
-            customType: "background-bash-completion",
-            content: taskCard(task, {
-              tail: tailLines(fileTaskOutput(task), failed ? MAX_OUTPUT_LINES : CARD_TAIL_LINES,
-                failed ? MAX_OUTPUT_BYTES : CARD_TAIL_CHARS),
-              logPath: fileTaskOutput(task),
-              status: failed ? `failed (exit ${exitCode})` : "completed",
-            }),
-            details: { exitCode, taskId: task.id },
-            display: true,
-          },
-          // Always steer, never followUp: a follow-up waits in the agent's in-memory
-          // queue until the run would otherwise stop, and pi drops that queue when the
-          // user aborts — leaving a session entry the model never saw.
-          { deliverAs: "steer", triggerTurn: true },
-        );
-      }
-      renderSidebar(tasks, ui);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
-      task.reporting = false;
-    }
-  };
-
-  const watchFileTask = (task: Task, ui: ExtensionUIContext): void => {
-    if (!task.directory || task.watcher) return;
-    task.watcher = watchSync(task.directory, () => void completeFileTask(task, ui));
-    void completeFileTask(task, ui);
-  };
-
   // ── Direct task completion ───────────────────────────────────────────────
   const completeDirectTask = (task: Task, code: number | null, ui: ExtensionUIContext): void => {
-    const logPath = task.logPath!;
+    const logPath = task.logPath;
     task.exitCode = code ?? 1;
     task.done = true;
 
@@ -425,45 +306,16 @@ export default function (pi: ExtensionAPI) {
     renderSidebar(tasks, ui);
   };
 
-  // ── Session recovery ─────────────────────────────────────────────────────
-  const recoverFileTasks = async (ui: ExtensionUIContext, sessionManager: { getSessionId: () => string }): Promise<void> => {
-    const root = taskRoot(sessionManager.getSessionId());
-    if (!existsSync(root)) return;
-
-    for (const entry of await readdir(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() || tasks.has(entry.name)) continue;
-      const taskDir = join(root, entry.name);
-      if (existsSync(join(taskDir, "reported"))) continue;
-      try {
-        const metaRaw = await readFile(join(taskDir, "meta.json"), "utf8");
-        const meta = JSON.parse(metaRaw) as { id: string; pid: number; cwd: string; startedAt: number };
-        const task: Task = {
-          id: meta.id,
-          pid: meta.pid,
-          command: "",
-          cwd: meta.cwd,
-          startedAt: meta.startedAt,
-          directory: taskDir,
-        };
-        try {
-          task.command = (await readFile(join(taskDir, "command.sh"), "utf8")).trim();
-        } catch { /* best-effort */ }
-        tasks.set(task.id, task);
-        if (!isFileTaskDone(task)) watchFileTask(task, ui);
-        else void completeFileTask(task, ui);
-      } catch { /* skip corrupt entry */ }
-    }
-  };
-
   // ── Foreground execution with auto-background ────────────────────────────
   const runForeground = async (
     command: string,
     ui: ExtensionUIContext,
     cwd: string,
+    logDirPath: string,
     onUpdate?: (update: { content: { type: "text"; text: string }[]; details: undefined }) => void,
   ): Promise<{ content: { type: "text"; text: string }[]; details?: undefined }> => {
     const id = `bg-${randomBytes(4).toString("hex")}`;
-    const logPath = join(LOG_DIR, `${id}.log`);
+    const logPath = join(logDirPath, `${id}.log`);
 
     const { proc, pid, exit } = spawnWithFileOutput(command, cwd, logPath);
 
@@ -580,46 +432,28 @@ export default function (pi: ExtensionAPI) {
       const ui = ctx.ui;
 
       if (p.run_in_background) {
-        // Explicit background — use runner.sh (file-based)
-        const sessionId = ctx.sessionManager.getSessionId();
+        // Explicit background: the same detached-process shape as the auto-background
+        // path, only the log lives under this session's log directory.
         const id = randomBytes(8).toString("hex");
-        const directory = taskPath(sessionId, id);
-        await ensureDirectory(directory);
-        await writeTaskFiles(directory, p.command);
+        const logPath = join(logDir(ctx.sessionManager.getSessionId()), `${id}.log`);
+        const { proc, pid, exit } = spawnWithFileOutput(p.command, ctx.cwd, logPath);
 
-        let task: Task | undefined;
-        try {
-          const child = spawn(join(directory, "runner.sh"), [], {
-            cwd: ctx.cwd,
-            detached: true,
-            stdio: "ignore",
-          });
-          if (!child.pid) throw new Error("background process did not start");
-          child.unref();
-          task = { id, pid: child.pid, command: p.command, cwd: ctx.cwd, startedAt: Date.now(), directory };
-          await writeFile(join(directory, "meta.json"), JSON.stringify({
-            id, pid: child.pid, cwd: ctx.cwd, startedAt: task.startedAt,
-          }), { mode: 0o600 });
-          tasks.set(id, task);
-          watchFileTask(task, ui);
-          renderSidebar(tasks, ui);
-        } catch (error) {
-          if (task) {
-            stopWatching(task);
-            tasks.delete(task.id);
-            try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
-          }
-          throw error;
-        }
+        const task: Task = {
+          id, command: p.command, pid, startedAt: Date.now(), cwd: ctx.cwd, proc, logPath, exit,
+        };
+        tasks.set(id, task);
+        renderSidebar(tasks, ui);
+        proc.unref();
+        exit.then((code) => completeDirectTask(task, code, ui));
 
         return {
-          content: [{ type: "text" as const, text: startCard(task, fileTaskOutput(task)) }],
+          content: [{ type: "text" as const, text: startCard(task, logPath) }],
           details: undefined,
         };
       }
 
       // Foreground with auto-background
-      return runForeground(p.command, ui, ctx.cwd, onUpdate);
+      return runForeground(p.command, ui, ctx.cwd, logDir(ctx.sessionManager.getSessionId()), onUpdate);
     },
   });
 
@@ -640,11 +474,9 @@ export default function (pi: ExtensionAPI) {
       if (params.action === "list") {
         const lines: string[] = [];
         for (const task of tasks.values()) {
-          const running = task.directory ? !isFileTaskDone(task) : !task.done;
-          if (!running) continue;
+          if (task.done) continue;
           const seconds = Math.floor((Date.now() - task.startedAt) / 1000);
-          const kind = task.directory ? "bg" : "auto";
-          lines.push(`${task.id} ${kind} ${seconds}s`);
+          lines.push(`${task.id} ${seconds}s`);
         }
         renderSidebar(tasks, ui);
         return {
@@ -658,7 +490,7 @@ export default function (pi: ExtensionAPI) {
         const task = tasks.get(params.taskId);
         if (!task) throw new Error(`Unknown background task: ${params.taskId}`);
 
-        const isRunning = (): boolean => task.directory ? !isFileTaskDone(task) : !task.done;
+        const isRunning = (): boolean => !task.done;
         const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(0, params.seconds ?? WAIT_DEFAULT_SECONDS));
         const deadline = Date.now() + seconds * 1_000;
 
@@ -681,7 +513,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         const waited = formatDuration(Date.now() - (deadline - seconds * 1_000));
-        const logPath = logPathOf(task);
+        const logPath = task.logPath;
         const tail = tailLines(logPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
         const status = handedOver
           ? task.exitCode === 0 ? "completed" : `failed (exit ${task.exitCode ?? "?"})`
@@ -703,30 +535,20 @@ export default function (pi: ExtensionAPI) {
       if (!params.taskId) throw new Error("taskId is required for kill.");
       const task = tasks.get(params.taskId);
       if (!task) throw new Error(`Unknown background task: ${params.taskId}`);
-
-      if (task.directory) {
-        const done = existsSync(join(task.directory, "done"));
-        const cancelled = existsSync(join(task.directory, "cancelled"));
-        if (done || cancelled) {
-          return {
-            content: [{ type: "text" as const, text: `Task ${task.id} is already finished.` }],
-            details: undefined,
-          };
-        }
-        // Signal first: a failed kill must leave the watcher armed, otherwise the
-        // task would never report anything again.
-        try { process.kill(-task.pid, "SIGTERM"); } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-        }
-        await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
-        stopWatching(task);
-      } else {
-        task.cancelled = true;
-        try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
-        // The log stays: the card names it, and a task killed on purpose is exactly the
-        // case where its output is worth keeping. /bg → Remove still cleans it up.
-        tasks.delete(task.id);
+      if (task.done) {
+        return {
+          content: [{ type: "text" as const, text: `Task ${task.id} is already finished.` }],
+          details: undefined,
+        };
       }
+      // Signal first: a kill that fails must leave the task reporting, not silently vanish.
+      try { process.kill(-task.pid, "SIGTERM"); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      task.cancelled = true;
+      // The log stays: the card names it, and a kill is exactly the case where the output
+      // is worth reading afterwards. /bg → Remove still deletes it.
+      tasks.delete(task.id);
       renderSidebar(tasks, ui);
       return {
         content: [{ type: "text" as const, text: `Stopped background task ${task.id}.` }],
@@ -742,14 +564,10 @@ export default function (pi: ExtensionAPI) {
       const ui = ctx.ui as ExtensionUIContext;
 
       while (true) {
-        const running = [...tasks.values()].filter(t => {
-          if (t.directory) return !isFileTaskDone(t);
-          return !t.done;
-        }).sort((a, b) => b.startedAt - a.startedAt);
-        const terminal = [...tasks.values()].filter(t => {
-          if (t.directory) return isFileTaskDone(t);
-          return t.done;
-        }).sort((a, b) => b.startedAt - a.startedAt);
+        const running = [...tasks.values()].filter(t => !t.done)
+          .sort((a, b) => b.startedAt - a.startedAt);
+        const terminal = [...tasks.values()].filter(t => t.done)
+          .sort((a, b) => b.startedAt - a.startedAt);
         const all = [...running, ...terminal];
 
         if (all.length === 0) {
@@ -758,7 +576,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         const items = all.map(t => {
-          const isTerminal = t.done || (t.directory && isFileTaskDone(t));
+          const isTerminal = t.done;
           const failed = t.exitCode !== undefined && t.exitCode !== 0;
           const icon = failed ? "✗" : isTerminal ? "✓" : "▶";
           const cmd = t.command.length > 40 ? t.command.slice(0, 37) + "..." : t.command;
@@ -775,7 +593,7 @@ export default function (pi: ExtensionAPI) {
 
         // Show actions for selected task
         const label = task.id.slice(-8);
-        const isRunning = task.directory ? !isFileTaskDone(task) : !task.done;
+        const isRunning = !task.done;
 
         const actions = isRunning
           ? ["Show Output", "Kill", "← Back"]
@@ -790,15 +608,10 @@ export default function (pi: ExtensionAPI) {
         if (action === "Show Output") {
           let output = "(no output)";
           try {
-            if (task.directory) {
-              const p = fileTaskOutput(task);
-              output = await readFile(p, "utf8") || "(empty)";
-            } else if (task.logPath) {
-              output = await readFile(task.logPath, "utf8") || "(empty)";
-            }
+            output = await readFile(task.logPath, "utf8") || "(empty)";
           } catch { /* best-effort */ }
           const dur = formatDuration(Date.now() - task.startedAt);
-          const meta = `Command: ${task.command}\nPID: ${task.pid} · Duration: ${dur}\nLog: ${task.logPath || task.directory}`;
+          const meta = `Command: ${task.command}\nPID: ${task.pid} · Duration: ${dur}\nLog: ${task.logPath}`;
           await ui.editor(`Output: ${label}`, `${meta}\n\n--- OUTPUT ---\n${output}`);
           continue;
         }
@@ -810,19 +623,13 @@ export default function (pi: ExtensionAPI) {
             "Reason (sent to agent, optional)",
           );
           if (reason === undefined) continue; // cancelled — abort kill
-          const killedLogPath = logPathOf(task);
+          const killedLogPath = task.logPath;
           const killedTail = tailLines(killedLogPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
-          if (task.directory) {
-            try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
-            await writeFile(join(task.directory, "cancelled"), "", { flag: "wx", mode: 0o600 });
-            stopWatching(task);
-          } else {
-            task.cancelled = true;
-            try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
-            // The log stays: the card above names it, and a kill is exactly the case
-            // where the output is worth reading afterwards. Remove still deletes it.
-            tasks.delete(task.id);
-          }
+          task.cancelled = true;
+          try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
+          // The log stays: the card above names it, and a kill is exactly the case where
+          // the output is worth reading afterwards. Remove still deletes it.
+          tasks.delete(task.id);
           renderSidebar(tasks, ui);
           const trimmed = reason.trim();
           pi.sendMessage(
@@ -845,8 +652,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (action === "Remove") {
-          stopWatching(task);
-          try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
+          try { unlinkSync(task.logPath); } catch { /* ok */ }
           tasks.delete(task.id);
           renderSidebar(tasks, ui);
           ui.notify(`Removed ${label}`, "info");
@@ -857,19 +663,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── Event hooks ───────────────────────────────────────────────────────────
-  pi.on("session_start", async (_event, ctx) => {
-    await recoverFileTasks(ctx.ui, ctx.sessionManager);
-    renderSidebar(tasks, ctx.ui);
-  });
-
   pi.on("session_shutdown", () => {
     sessionStale = true;
     stopSidebarTicker();
+    // Nothing is restored on the next start: a reload kills what this session started.
     for (const task of tasks.values()) {
-      stopWatching(task);
-      if (task.proc && !task.directory) {
-        try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
-      }
+      try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
     }
     tasks.clear();
   });
@@ -885,9 +684,6 @@ export default function (pi: ExtensionAPI) {
 
 // ── Self-tests ──────────────────────────────────────────────────────────────
 if (process.env.BACKGROUND_BASH_SELF_TEST === "1") {
-  const quoted = shellQuote("a'b");
-  if (quoted !== "'a'\"'\"'b'") throw new Error("shellQuote self-check failed");
-
   const lines = new Text("x".repeat(308), 0, 0).render(95);
   if (lines.some((line) => visibleWidth(line) > 95)) {
     throw new Error("completion renderer self-check failed");
