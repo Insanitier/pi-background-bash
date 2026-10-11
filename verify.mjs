@@ -8,8 +8,8 @@
  *   1. the module parses and loads (type stripping plus the whole import graph)
  *   2. the bash guidance keeps long work inside the tracked shell instead of
  *      telling the model to hand-detach it with nohup/setsid/&
- *   3. completion notices: skipped inside the 2s window, and `steer` (rides along with
- *      whatever the session is doing) outside it, never an end-of-turn follow-up
+ *   3. completion notices always ride along with the run (`steer`), never an end-of-turn
+ *      follow-up that can be dropped — and never suppressed just because the task was quick
  *   4. a task with a `background_task wait` in flight produces NO completion card,
  *      because that wait's own result already carries the same outcome
  *   5. a task stopped on purpose reports nothing
@@ -20,6 +20,9 @@
  *   9. cards carry sanitized output: escape sequences never reach the model
  *  10. `background_task output` is gone; an unknown action fails loudly instead of
  *      falling into the kill branch
+ *  11. a bounded wait hands back a snapshot (status + tail + log path) and leaves the task
+ *      alone; a wait that timed out does NOT swallow the completion card
+ *  12. the log of a task killed on purpose survives, so the path on its card stays valid
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -30,7 +33,7 @@
  * Run it with `node verify.mjs` (or `npm test`); it takes a few seconds.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -79,6 +82,7 @@ process.env.BACKGROUND_BASH_AUTO_BG_MS = "400";
 process.env.BACKGROUND_BASH_SELF_TEST = "1";
 
 const SESSION_ID = `verify-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
+const STARTED_AT = Date.now();
 const WORK_DIR = join(HOME, "work");
 mkdirSync(WORK_DIR, { recursive: true });
 const TASK_ROOT = join(tmpdir(), "pi-background-bash", Buffer.from(SESSION_ID).toString("base64url"));
@@ -163,11 +167,14 @@ check(
 // ── 4. Explicit background task: completion arrives as steer ────────────────
 const quick = await run("bash", { command: "echo hello-from-a-background-task", run_in_background: true });
 const quickId = idOf(quick.content[0].text);
-await new Promise((resolve) => setTimeout(resolve, 600));
+const quickCard = quickId ? (await until(() => cardsFor(quickId).length === 1), cardsFor(quickId)[0]) : undefined;
 check(
-	"a task that finishes inside the 2s window reports nothing",
-	quickId !== undefined && cardsFor(quickId).length === 0,
-	JSON.stringify({ id: quickId, cards: cardsFor(quickId).length }),
+	"a background task that finishes immediately still reports its outcome",
+	quickId !== undefined &&
+		cardsFor(quickId).length === 1 &&
+		String(quickCard?.content).includes("hello-from-a-background-task") &&
+		String(quickCard?.content).split("\n").at(-1) === "completed",
+	JSON.stringify({ id: quickId, cards: cardsFor(quickId).length, card: quickCard?.content }),
 );
 
 const launched = await run("bash", { command: "sleep 2.5; echo slow-enough-to-report", run_in_background: true });
@@ -197,6 +204,37 @@ check(
 	JSON.stringify({ id: waitId, result: waitResult.content[0].text, cards: cardsFor(waitId).length }),
 );
 
+// ── 5b. A bounded wait hands back a snapshot; a timeout keeps the card ─────
+const snapshot = await run("bash", { command: "echo started-work; sleep 3.5; echo finished-work", run_in_background: true });
+const snapshotId = idOf(snapshot.content[0].text);
+await new Promise((resolve) => setTimeout(resolve, 400)); // let the first line land
+const peek = snapshotId
+	? await run("background_task", { action: "wait", taskId: snapshotId, seconds: 0 })
+	: { content: [{ text: "" }] };
+const peekText = String(peek.content[0].text);
+check(
+	"wait 0 returns status, tail and log path, and leaves the task running",
+	snapshotId !== undefined &&
+		peekText.includes("started-work") &&
+		peekText.includes("Log: ") &&
+		peekText.split("\n").at(-1) === "still running after 0s (not a failure; the task is unaffected)",
+	JSON.stringify({ id: snapshotId, text: peekText }),
+);
+
+const bounded = snapshotId
+	? await run("background_task", { action: "wait", taskId: snapshotId, seconds: 1 })
+	: { content: [{ text: "" }] };
+const boundedText = String(bounded.content[0].text);
+const laterCard = snapshotId ? (await until(() => cardsFor(snapshotId).length === 1, 8_000), cardsFor(snapshotId)[0]) : undefined;
+check(
+	"a wait that timed out does not swallow the completion card",
+	snapshotId !== undefined &&
+		boundedText.split("\n").at(-1) === "still running after 1s (not a failure; the task is unaffected)" &&
+		cardsFor(snapshotId).length === 1 &&
+		String(laterCard?.content).split("\n").at(-1) === "completed",
+	JSON.stringify({ id: snapshotId, wait: boundedText, cards: cardsFor(snapshotId).length, card: laterCard?.content }),
+);
+
 // ── 6. A stopped task reports nothing ──────────────────────────────────────
 const doomed = await run("bash", { command: "sleep 30", run_in_background: true });
 const doomedId = idOf(doomed.content[0].text);
@@ -215,12 +253,17 @@ check(
 // ── 6b. A user kill from /bg delivers the typed reason as steer ────────────
 const victim = await run("bash", { command: "echo about-to-be-killed; sleep 30", run_in_background: true });
 const victimId = idOf(victim.content[0].text);
+// Long enough for the runner to create output.log and print its first line: killing a
+// task in its first milliseconds would leave the card without a tail to assert on.
+await new Promise((resolve) => setTimeout(resolve, 600));
 await commands.get("bg").handler(undefined, ctx);
 await new Promise((resolve) => setTimeout(resolve, 400));
 const killNotice = calls.messages.find(
 	(m) => m.customType === "background-bash-completion" && /killed by user/.test(String(m.content)),
 );
 const killLines = String(killNotice?.content ?? "").split("\n");
+// The line just above `Log: ` is the tail; the outcome is always the last line.
+const killLogIndex = killLines.findIndex((line) => line.startsWith("Log: "));
 check(
 	"a user kill from /bg delivers the typed reason with steer",
 	victimId !== undefined &&
@@ -228,11 +271,21 @@ check(
 		String(killNotice.content).includes(victimId) &&
 		killLines.at(-1) === `killed by user: ${KILL_REASON}` &&
 		String(killNotice.content).includes("Log: ") &&
-		String(killNotice.content).includes("about-to-be-killed") &&
+		// The line above the log path, not the command echoed in the first line — that
+		// one would pass even with no output at all.
+		killLogIndex > 0 &&
+		killLines[killLogIndex - 1] === "about-to-be-killed" &&
 		killNotice.details?.reason === KILL_REASON &&
 		killNotice.opts?.deliverAs === "steer" &&
 		killNotice.opts?.triggerTurn === true,
-	JSON.stringify({ id: victimId, notice: killNotice?.content, last: killLines.at(-1), opts: killNotice?.opts }),
+	JSON.stringify({ id: victimId, lines: killLines, opts: killNotice?.opts }),
+);
+
+check(
+	"the log of a task killed on purpose survives, so its card path stays valid",
+	killNotice !== undefined &&
+		existsSync(String(killNotice.content).split("Log: ")[1]?.split("\n")[0] ?? ""),
+	JSON.stringify({ path: String(killNotice?.content).split("Log: ")[1]?.split("\n")[0] }),
 );
 
 // ── 6c. Card shape: outcome last, tail and log path in between ─────────────
@@ -337,7 +390,16 @@ check(
 
 // ── 9. Cleanup ─────────────────────────────────────────────────────────────
 rmSync(TASK_ROOT, { recursive: true, force: true });
-rmSync(join(tmpdir(), "pi-bg"), { recursive: true, force: true });
+// Only the logs this run created: /tmp/pi-bg is shared with every other Pi session.
+const sharedLogDir = join(tmpdir(), "pi-bg");
+if (existsSync(sharedLogDir)) {
+	for (const entry of readdirSync(sharedLogDir)) {
+		const path = join(sharedLogDir, entry);
+		try {
+			if (statSync(path).mtimeMs >= STARTED_AT - 1_000) rmSync(path, { force: true });
+		} catch { /* best-effort */ }
+	}
+}
 rmSync(HOME, { recursive: true, force: true });
 
 const failed = checks.filter(([, ok]) => !ok);

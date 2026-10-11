@@ -18,6 +18,10 @@ const MAX_OUTPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_LINES = 200;
 const CARD_TAIL_CHARS = 2 * 1024;
 const CARD_TAIL_LINES = 20;
+// How long `wait` may block before handing control back with a snapshot. The point is
+// that a wait must never be able to hide the model from a task for 40 minutes.
+const WAIT_DEFAULT_SECONDS = 30;
+const WAIT_MAX_SECONDS = 60;
 // Overridable so the verify script can exercise the auto-background path.
 const AUTO_BG_TIMEOUT_MS = Number(process.env.BACKGROUND_BASH_AUTO_BG_MS ?? 120_000);
 const QUICK_COMPLETION_MS = 2_000;
@@ -53,6 +57,9 @@ const taskRoot = (sessionId: string): string =>
 const taskPath = (sessionId: string, taskId: string): string => join(taskRoot(sessionId), taskId);
 
 const fileTaskOutput = (task: Task): string => join(task.directory!, "output.log");
+
+/** Where a task's output lives, whichever of the two representations it uses. */
+const logPathOf = (task: Task): string => task.logPath ?? fileTaskOutput(task);
 
 const isFileTaskDone = (task: Task): boolean => {
   if (!task.directory) return false;
@@ -204,20 +211,22 @@ const shortCommand = (command: string): string =>
   command.length > 60 ? `${command.slice(0, 57)}...` : command;
 
 /** Every card has the same shape: description (command, id) → tail → log → outcome last. */
-function taskCard(task: Task, opts: { tail?: string; logPath?: string; status: string }): string {
-  const lines = [`"${shortCommand(task.command)}" (${formatDuration(Date.now() - task.startedAt)}, ${task.id})`];
+function taskCard(task: Task, opts: { tail?: string; logPath?: string; status: string; duration?: number }): string {
+  const shown = opts.duration ?? Date.now() - task.startedAt;
+  const lines = [`"${shortCommand(task.command)}" (${formatDuration(shown)}, ${task.id})`];
   if (opts.tail) lines.push(opts.tail);
   if (opts.logPath) lines.push(`Log: ${opts.logPath}`);
   lines.push(opts.status);
   return lines.join("\n");
 }
 
-/** The three ways out of a running task, repeated on every card that leaves one running. */
+/** The three decisions a running task actually poses, on every card that leaves one running.
+ *  Deliberately not "looks stuck → kill": a quiet log is not evidence of a hung job. */
 function runningHints(id: string): string {
   return [
-    `Need the result now → background_task wait ${id} (blocks; status only)`,
-    "Fine to keep going → no action; this card repeats when it finishes",
-    `Looks stuck → background_task kill ${id}`,
+    `Depends on this result? → background_task wait ${id} [seconds] — status, tail, log path; the task keeps running`,
+    `Need a progress check? → background_task wait ${id} 0, or read the log path above`,
+    `Decided it is wrong or unwanted? → background_task kill ${id}`,
   ].join("\n");
 }
 
@@ -238,12 +247,6 @@ function startCard(task: Task, logPath: string): string {
     `▶ "${shortCommand(task.command)}" (${task.id}) — running in the background; full log: ${logPath}`,
     runningHints(task.id),
   ].join("\n");
-}
-
-/** Suppress notification for tasks that finish very quickly (<2s) —
- *  the "started" message is still fresh, no need for a duplicate. */
-function shouldNotify(task: Task): boolean {
-  return Date.now() - task.startedAt >= 2_000;
 }
 
 
@@ -358,7 +361,7 @@ export default function (pi: ExtensionAPI) {
       await writeFile(join(task.directory, "reported"), "", { flag: "wx", mode: 0o600 });
 
       if (sessionStale) return;
-      if (shouldNotify(task) && !waitInFlight.has(task.id)) {
+      if (!waitInFlight.has(task.id)) {
         const failed = exitCode !== 0;
         pi.sendMessage(
           {
@@ -553,6 +556,9 @@ export default function (pi: ExtensionAPI) {
   const taskSchema = Type.Object({
     action: StringEnum(["list", "kill", "wait"] as const),
     taskId: Type.Optional(Type.String({ description: "Task ID" })),
+    seconds: Type.Optional(Type.Number({
+      description: "wait only: how long to block before returning a snapshot (default 30, max 60, 0 = look now)",
+    })),
   });
 
   // ── Register tools ───────────────────────────────────────────────────────
@@ -624,11 +630,11 @@ export default function (pi: ExtensionAPI) {
     description: "List, stop, or wait for background tasks.",
     promptSnippet: "Manage background tasks: list, kill, wait",
     promptGuidelines: [
-      "Background tasks auto-notify on completion — don't poll. Use wait to block until a task finishes.",
+      "Background tasks report their own outcome — never busy-poll with list or sleep. When the next step depends on the result, `wait <id> [seconds]` blocks for a while and returns status, a fresh tail and the log path; it never ends the task.",
       "Every card carries a tail of the output plus its log path; read the log with bash for the rest.",
     ],
     parameters: taskSchema,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const ui = ctx.ui;
 
       if (params.action === "list") {
@@ -653,30 +659,40 @@ export default function (pi: ExtensionAPI) {
         if (!task) throw new Error(`Unknown background task: ${params.taskId}`);
 
         const isRunning = (): boolean => task.directory ? !isFileTaskDone(task) : !task.done;
-        if (!isRunning()) {
-          return {
-            content: [{ type: "text" as const, text: `Task ${task.id} already finished (exit ${task.exitCode ?? "?"}).` }],
-            details: undefined,
-          };
-        }
+        const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(0, params.seconds ?? WAIT_DEFAULT_SECONDS));
+        const deadline = Date.now() + seconds * 1_000;
 
-        // Block until the task completes — replaces polling. While this wait is in
-        // flight the completion card is suppressed, because this result carries the
-        // same outcome; without it the card repeats what the model already has.
-        waitInFlight.add(task.id);
-        try {
-          while (isRunning()) {
-            await new Promise(r => setTimeout(r, 500));
+        // Registered only while this wait is live AND hands the outcome over: on timeout
+        // the registration is dropped again, because then the completion card is the only
+        // thing left that can deliver the outcome. Never claimed after a timeout or an
+        // abort — a wait that did not see the end must not suppress the card that did.
+        let handedOver = !isRunning();
+        if (!handedOver) {
+          waitInFlight.add(task.id);
+          try {
+            while (isRunning()) {
+              if (signal?.aborted || Date.now() >= deadline) break;
+              await new Promise((r) => setTimeout(r, 250));
+            }
+            handedOver = !isRunning();
+          } finally {
+            if (!handedOver) waitInFlight.delete(task.id);
           }
-        } finally {
-          waitInFlight.delete(task.id);
         }
 
-        const dur = formatDuration(Date.now() - task.startedAt);
-        const label = task.command.length > 40 ? task.command.slice(0, 37) + "..." : task.command;
-        const status = task.exitCode === 0 ? "completed" : task.exitCode !== undefined ? `failed (exit ${task.exitCode})` : "done";
+        const waited = formatDuration(Date.now() - (deadline - seconds * 1_000));
+        const logPath = logPathOf(task);
+        const tail = tailLines(logPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
+        const status = handedOver
+          ? task.exitCode === 0 ? "completed" : `failed (exit ${task.exitCode ?? "?"})`
+          : signal?.aborted
+            ? `wait cancelled after ${waited}; still running, unaffected`
+            : `still running after ${waited} (not a failure; the task is unaffected)`;
         return {
-          content: [{ type: "text" as const, text: `Task ${task.id} ${status} (${dur}): ${label}` }],
+          content: [{
+            type: "text" as const,
+            text: taskCard(task, { tail, logPath, status, duration: Date.now() - task.startedAt }),
+          }],
           details: undefined,
         };
       }
@@ -707,7 +723,8 @@ export default function (pi: ExtensionAPI) {
       } else {
         task.cancelled = true;
         try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
-        try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
+        // The log stays: the card names it, and a task killed on purpose is exactly the
+        // case where its output is worth keeping. /bg → Remove still cleans it up.
         tasks.delete(task.id);
       }
       renderSidebar(tasks, ui);
@@ -793,8 +810,7 @@ export default function (pi: ExtensionAPI) {
             "Reason (sent to agent, optional)",
           );
           if (reason === undefined) continue; // cancelled — abort kill
-          // Read the tail before killing: the log of a direct task is deleted below.
-          const killedLogPath = task.logPath ?? fileTaskOutput(task);
+          const killedLogPath = logPathOf(task);
           const killedTail = tailLines(killedLogPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
           if (task.directory) {
             try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
@@ -803,7 +819,8 @@ export default function (pi: ExtensionAPI) {
           } else {
             task.cancelled = true;
             try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
-            try { if (task.logPath) unlinkSync(task.logPath); } catch { /* ok */ }
+            // The log stays: the card above names it, and a kill is exactly the case
+            // where the output is worth reading afterwards. Remove still deletes it.
             tasks.delete(task.id);
           }
           renderSidebar(tasks, ui);
