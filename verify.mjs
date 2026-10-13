@@ -33,6 +33,9 @@
  *      with the uv equivalent (explicit interpreter paths included), python3 runs through
  *      uv, without uv it falls back to the real interpreter, and other commands are
  *      untouched
+ *  17. the completion notice renders as a card (Status title, command row, collapsed body
+ *      behind the real expand hint, log footer), the status line carries its `Status: `
+ *      prefix, and an entry written before the card existed still renders its text
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -112,6 +115,7 @@ const until = async (predicate, timeoutMs = 8_000) => {
 
 // ── 2. A stub Pi host: record tools, messages and UI frames ─────────────────
 const tools = new Map();
+const messageRenderers = new Map();
 const commands = new Map();
 const calls = { messages: [], status: [], widgets: [] };
 const KILL_REASON = "理由能不能送到";
@@ -135,7 +139,7 @@ const ui = {
 const handlers = new Map();
 const pi = {
 	registerTool: (def) => tools.set(def.name, def),
-	registerMessageRenderer: () => {},
+	registerMessageRenderer: (type, renderer) => messageRenderers.set(type, renderer),
 	registerCommand: (name, def) => commands.set(name, def),
 	on: (event, handler) => handlers.set(event, handler),
 	sendMessage: (message, opts) => calls.messages.push({ ...message, opts }),
@@ -264,7 +268,7 @@ check(
 	quickId !== undefined &&
 		cardsFor(quickId).length === 1 &&
 		String(quickCard?.content).includes("hello-from-a-background-task") &&
-		String(quickCard?.content).split("\n").at(-1) === "completed",
+		String(quickCard?.content).split("\n").at(-1) === "Status: completed",
 	JSON.stringify({ id: quickId, cards: cardsFor(quickId).length, card: quickCard?.content }),
 );
 
@@ -308,7 +312,7 @@ check(
 	snapshotId !== undefined &&
 		peekText.includes("started-work") &&
 		peekText.includes("Log: ") &&
-		peekText.split("\n").at(-1) === "still running after 0s (not a failure; the task is unaffected)",
+		peekText.split("\n").at(-1) === "Status: still running after 0s (not a failure; the task is unaffected)",
 	JSON.stringify({ id: snapshotId, text: peekText }),
 );
 
@@ -320,9 +324,9 @@ const laterCard = snapshotId ? (await until(() => cardsFor(snapshotId).length ==
 check(
 	"a wait that timed out does not swallow the completion card",
 	snapshotId !== undefined &&
-		boundedText.split("\n").at(-1) === "still running after 1s (not a failure; the task is unaffected)" &&
+		boundedText.split("\n").at(-1) === "Status: still running after 1s (not a failure; the task is unaffected)" &&
 		cardsFor(snapshotId).length === 1 &&
-		String(laterCard?.content).split("\n").at(-1) === "completed",
+		String(laterCard?.content).split("\n").at(-1) === "Status: completed",
 	JSON.stringify({ id: snapshotId, wait: boundedText, cards: cardsFor(snapshotId).length, card: laterCard?.content }),
 );
 
@@ -336,7 +340,7 @@ const afterLogIndex = afterLines.findIndex((line) => line.startsWith("Log: "));
 check(
 	"waiting on a finished task returns the same shape, immediately",
 	firstId !== undefined &&
-		afterLines.at(-1) === "completed" &&
+		afterLines.at(-1) === "Status: completed" &&
 		afterLogIndex > 0 &&
 		afterLines[afterLogIndex - 1].includes("slow-enough-to-report") &&
 		afterLines[0].includes(firstId),
@@ -360,11 +364,11 @@ const cancelCard = cancelId
 check(
 	"an aborted wait reports itself cancelled and still lets the card through",
 	cancelId !== undefined &&
-		cancelledText.split("\n").at(-1) === "wait cancelled after 0s; still running, unaffected" &&
+		cancelledText.split("\n").at(-1) === "Status: wait cancelled after 0s; still running, unaffected" &&
 		cancelledText.includes("cancel-me") &&
 		cancelledText.includes("Log: ") &&
 		cardsFor(cancelId).length === 1 &&
-		String(cancelCard?.content).split("\n").at(-1) === "completed",
+		String(cancelCard?.content).split("\n").at(-1) === "Status: completed",
 	JSON.stringify({ id: cancelId, wait: cancelledText, cards: cardsFor(cancelId).length, card: cancelCard?.content }),
 );
 
@@ -433,7 +437,7 @@ check(
 	victimId !== undefined &&
 		killNotice !== undefined &&
 		String(killNotice.content).includes(victimId) &&
-		killLines.at(-1) === `killed by user: ${KILL_REASON}` &&
+		killLines.at(-1) === `Status: killed by user: ${KILL_REASON}` &&
 		String(killNotice.content).includes("Log: ") &&
 		// The line above the log path, not the command echoed in the first line — that
 		// one would pass even with no output at all.
@@ -460,7 +464,7 @@ check(
 		/^".*" \(.*, [0-9a-f]{16}\)$/.test(successLines[0]) &&
 		String(firstCard?.content).includes("slow-enough-to-report") &&
 		successLines.at(-2)?.startsWith("Log: ") === true &&
-		successLines.at(-1) === "completed",
+		successLines.at(-1) === "Status: completed",
 	JSON.stringify({ lines: successLines }),
 );
 
@@ -471,7 +475,7 @@ check(
 	"a failure card ends with the exit code and keeps the old, larger tail",
 	failedId !== undefined &&
 		String(failedCard?.content).includes("boom") &&
-		String(failedCard?.content).split("\n").at(-1) === "failed (exit 3)",
+		String(failedCard?.content).split("\n").at(-1) === "Status: failed (exit 3)",
 	JSON.stringify({ id: failedId, card: failedCard?.content }),
 );
 
@@ -531,7 +535,7 @@ const autoLogPath = autoLines[autoLogIndex]?.slice("Log: ".length) ?? "";
 check(
 	"an auto-backgrounded task ends in the same card shape as an explicit one",
 	autoDoneId !== undefined &&
-		autoLines.at(-1) === "completed" &&
+		autoLines.at(-1) === "Status: completed" &&
 		autoLogIndex > 0 &&
 		autoLines[autoLogIndex - 1] === "bg-done" &&
 		// Same contract, same place on disk: the session directory, keyed by task id.
@@ -598,6 +602,70 @@ check(
 	"shutdown kills every task of this session, explicit and auto-backgrounded alike",
 	bothAlive && pids.every((pid) => !isAlivePid(pid)),
 	JSON.stringify({ pids, bothAlive, alive: pids.map(isAlivePid) }),
+);
+
+// ── 10. The completion notice as a card, not raw text ───────────────────────
+// pi hands a custom renderer's component straight to the transcript and wraps it in
+// nothing, which is where "it looks like a message typed into my conversation" came from.
+// Render the component here and assert on the lines it produces.
+const { initTheme } = await import("@earendil-works/pi-coding-agent");
+let themeReady = true;
+try {
+	initTheme();
+} catch {
+	themeReady = false;
+}
+const messageRenderer = messageRenderers.get("background-bash-completion");
+const fakeTheme = { fg: (_color, text) => text, bold: (text) => text };
+const renderCard = (message, expanded) =>
+	messageRenderer
+		? String(messageRenderer(message, { expanded, outputPad: 1 }, fakeTheme).render(100).join("\n"))
+		: "";
+const synthetic = {
+	customType: "background-bash-completion",
+	content: "raw fallback text",
+	details: {
+		taskId: "bg-12345678",
+		status: "completed",
+		command: "echo hi",
+		durationMs: 1500,
+		logPath: "/tmp/example.log",
+		tail: Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join("\n"),
+	},
+};
+const collapsed = renderCard(synthetic, false);
+const expanded = renderCard(synthetic, true);
+check(
+	"the completion card is a card: Status title, command row, collapsed body, log footer",
+	Boolean(messageRenderer) &&
+		/⏵ bg-12345678 · Status: completed/.test(collapsed) &&
+		collapsed.includes("$ echo hi") &&
+		collapsed.includes("Log: /tmp/example.log") &&
+		(!themeReady || /\(7 earlier lines,/.test(collapsed)) &&
+		!/^line 1$/m.test(collapsed),
+	JSON.stringify({ themeReady, collapsed: collapsed.slice(0, 400) }),
+);
+check(
+	"expanding the card drops the hint and shows the whole tail",
+	expanded.includes("line 12") &&
+		(!themeReady || !/earlier lines/.test(expanded)) &&
+		expanded.split("\n").length > collapsed.split("\n").length,
+	JSON.stringify({ expanded: expanded.slice(0, 400) }),
+);
+check(
+	"an entry written before the card existed still renders its text",
+	renderCard({ content: "old card\nStatus: completed", details: { taskId: "bg-x" } }, false).includes("old card"),
+	"fallback path",
+);
+const notice = cards().find((m) => m.details?.status === "completed" && m.details?.logPath);
+check(
+	"the completion notice carries what the card needs (status, command, log, tail)",
+	Boolean(notice) &&
+		typeof notice.details.command === "string" &&
+		typeof notice.details.durationMs === "number" &&
+		typeof notice.details.tail === "string" &&
+		notice.details.tail.length > 0,
+	JSON.stringify(notice?.details ?? null).slice(0, 300),
 );
 
 // ── 9. Cleanup ─────────────────────────────────────────────────────────────

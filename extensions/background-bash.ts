@@ -6,8 +6,13 @@ import { openSync, closeSync, fstatSync, readSync, unlinkSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { Text, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  keyHint,
+  truncateToVisualLines,
+  type ExtensionAPI,
+  type ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
+import { Container, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -294,7 +299,7 @@ function taskCard(task: Task, opts: { tail?: string; logPath?: string; status: s
   const lines = [`"${shortCommand(task.command)}" (${formatDuration(shown)}, ${task.id})`];
   if (opts.tail) lines.push(opts.tail);
   if (opts.logPath) lines.push(`Log: ${opts.logPath}`);
-  lines.push(opts.status);
+  lines.push(`Status: ${opts.status}`);
   return lines.join("\n");
 }
 
@@ -392,10 +397,89 @@ function stopSidebarTicker(): void {
   }
 }
 
+// ── The card the user sees ───────────────────────────────────────────────────
+// pi hands a custom renderer's component straight to the transcript ("it handles its own
+// styling") and wraps it in nothing, so a bare Text(content) reads as raw text pasted into
+// the conversation — which is exactly how a multi-line notice looked. Build the shape the
+// built-in tool cards use instead: a title row, muted metadata, a body that collapses to a
+// preview behind the real "ctrl+o to expand" hint, and a muted footer. `details` carries the
+// pieces; `content` stays the model-facing text, and it remains the fallback for entries
+// written before this renderer existed, so replaying an old session still works.
+interface CompletionCardDetails {
+  taskId: string;
+  status?: string;
+  exitCode?: number;
+  reason?: string;
+  command?: string;
+  durationMs?: number;
+  logPath?: string;
+  tail?: string;
+}
+
+/** Visual lines a collapsed card shows, the same count the built-in bash card uses. */
+const CARD_PREVIEW_LINES = 5;
+
 // ── Extension entry ──────────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
-  pi.registerMessageRenderer("background-bash-completion", (message) =>
-    new Text(message.content, 0, 0),
+  pi.registerMessageRenderer<CompletionCardDetails>(
+    "background-bash-completion",
+    (message, options, theme) => {
+      const d = message.details;
+      // No details: an entry from before this card existed. Render its text as it was.
+      if (!d?.status) return new Text(message.content, 0, 0);
+
+      const pad = Math.max(0, options.outputPad ?? 1);
+      const indent = " ".repeat(pad);
+      const muted = (text: string): string => theme.fg("muted", text);
+      // One row, cut to the width so a long command cannot wrap the card out of shape.
+      const row = (text: string) => ({
+        render: (width: number) => [
+          `${indent}${truncateToWidth(text, Math.max(1, width - pad), "…")}`,
+        ],
+        invalidate: () => {},
+      });
+
+      const card = new Container();
+      card.addChild(
+        new Text(theme.fg("toolTitle", theme.bold(`⏵ ${d.taskId} · Status: ${d.status}`)), pad, 0),
+      );
+      if (d.command) card.addChild(row(muted(`$ ${d.command}`)));
+
+      const tail = (d.tail ?? "").trimEnd();
+      if (tail) {
+        const styled = tail
+          .split("\n")
+          .map((line) => theme.fg("toolOutput", line))
+          .join("\n");
+        if (options.expanded) {
+          card.addChild(new Text(styled, pad, 0));
+        } else {
+          card.addChild({
+            render: (width: number) => {
+              const preview = truncateToVisualLines(
+                styled,
+                CARD_PREVIEW_LINES,
+                Math.max(1, width - pad),
+              );
+              const body = preview.visualLines.map((line) => `${indent}${line}`);
+              if (!preview.skippedCount) return body;
+              const hint =
+                muted(`... (${preview.skippedCount} earlier lines,`) +
+                ` ${keyHint("app.tools.expand", "to expand")}` +
+                muted(")");
+              return [`${indent}${hint}`, ...body];
+            },
+            invalidate: () => {},
+          });
+        }
+      }
+
+      if (d.logPath) {
+        const took = d.durationMs !== undefined ? ` · took ${formatDuration(d.durationMs)}` : "";
+        card.addChild(new Text(muted(`Log: ${d.logPath}${took}`), pad, 0));
+      }
+      return card;
+    },
   );
 
   const tasks = new Map<string, Task>();
@@ -418,16 +502,25 @@ export default function (pi: ExtensionAPI) {
     }
     const exitCode = code ?? 1;
     const failed = exitCode !== 0;
+    const status = failed ? `failed (exit ${exitCode})` : "completed";
+    const tail = tailLines(logPath, failed ? MAX_OUTPUT_LINES : CARD_TAIL_LINES,
+      failed ? MAX_OUTPUT_BYTES : CARD_TAIL_CHARS);
+    // One duration for both the text and the card, so they cannot disagree.
+    const shown = Date.now() - task.startedAt;
+    const details: CompletionCardDetails = {
+      taskId: task.id,
+      status,
+      exitCode,
+      command: task.command,
+      durationMs: shown,
+      logPath,
+      tail,
+    };
     pi.sendMessage(
       {
         customType: "background-bash-completion",
-        content: taskCard(task, {
-          tail: tailLines(logPath, failed ? MAX_OUTPUT_LINES : CARD_TAIL_LINES,
-            failed ? MAX_OUTPUT_BYTES : CARD_TAIL_CHARS),
-          logPath,
-          status: failed ? `failed (exit ${exitCode})` : "completed",
-        }),
-        details: { exitCode, taskId: task.id },
+        content: taskCard(task, { tail, logPath, status, duration: shown }),
+        details,
         display: true,
       },
       { deliverAs: "steer", triggerTurn: true },
@@ -799,15 +892,27 @@ export default function (pi: ExtensionAPI) {
           tasks.delete(task.id);
           renderSidebar(tasks, ui);
           const trimmed = reason.trim();
+          const killStatus = trimmed ? `killed by user: ${trimmed}` : "killed by user";
+          const killShown = Date.now() - task.startedAt;
+          const killDetails: CompletionCardDetails = {
+            taskId: task.id,
+            status: killStatus,
+            reason: trimmed || undefined,
+            command: task.command,
+            durationMs: killShown,
+            logPath: killedLogPath,
+            tail: killedTail,
+          };
           pi.sendMessage(
             {
               customType: "background-bash-completion",
               content: taskCard(task, {
                 tail: killedTail,
                 logPath: killedLogPath,
-                status: trimmed ? `killed by user: ${trimmed}` : "killed by user",
+                status: killStatus,
+                duration: killShown,
               }),
-              details: { taskId: task.id, reason: trimmed || undefined },
+              details: killDetails,
               display: true,
             },
             // Same reason as the completion notice: followUp can be dropped before the
