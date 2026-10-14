@@ -613,7 +613,8 @@ try {
 	themeReady = false;
 }
 const messageRenderer = messageRenderers.get("background-bash-completion");
-const fakeTheme = { fg: (_color, text) => text, bold: (text) => text };
+// `bg` is required now: the card builds its own Box, so the renderer calls theme.bg.
+const fakeTheme = { fg: (_color, text) => text, bold: (text) => text, bg: (_color, text) => text };
 const renderCard = (message, expanded) =>
 	messageRenderer
 		? String(messageRenderer(message, { expanded, outputPad: 1 }, fakeTheme).render(100).join("\n"))
@@ -648,6 +649,44 @@ check(
 		(!themeReady || !/earlier lines/.test(expanded)) &&
 		expanded.split("\n").length > collapsed.split("\n").length,
 	JSON.stringify({ expanded: expanded.slice(0, 400) }),
+);
+// pi skips its own customMessageBg box as soon as a renderer is registered, so the frame
+// has to be drawn by the renderer. Tag the background and require it on every line: that
+// is a whole frame — no line of the card left outside it, top and bottom padding included.
+const bgTheme = {
+	fg: (_color, text) => text,
+	bold: (text) => text,
+	bg: (_color, text) => `<bg>${text}</bg>`,
+};
+const framed = messageRenderer
+	? String(messageRenderer(synthetic, { expanded: false, outputPad: 1 }, bgTheme).render(100).join("\n")).split("\n")
+	: [];
+check(
+	"the card draws its own frame: every line sits inside the background box",
+	framed.length > 0 && framed.every((line) => line.startsWith("<bg>") && line.endsWith("</bg>")),
+	JSON.stringify(framed.slice(0, 3)),
+);
+// The frame's colour follows the outcome, by the tool cards' own rule. Read the colour off
+// the theme instead of the lines, so the check survives a theme where two panels are close.
+const frameKeys = (message) => {
+	const seen = new Set();
+	const keyTheme = { fg: (_color, text) => text, bold: (text) => text, bg: (color, text) => (seen.add(color), text) };
+	messageRenderer(message, { expanded: false, outputPad: 1 }, keyTheme).render(100);
+	return [...seen].join(",");
+};
+const withStatus = (status) => ({ ...synthetic, details: { ...synthetic.details, status } });
+check(
+	"the frame colour follows the outcome, as pi's tool cards do",
+	frameKeys(synthetic) === "toolSuccessBg" &&
+		frameKeys(withStatus("failed (exit 1)")) === "toolErrorBg" &&
+		frameKeys(withStatus("killed by user: swapped branch")) === "toolSuccessBg" &&
+		frameKeys({ ...synthetic, details: { taskId: "bg-x" } }) === "customMessageBg",
+	JSON.stringify({
+		completed: frameKeys(synthetic),
+		failed: frameKeys(withStatus("failed (exit 1)")),
+		killed: frameKeys(withStatus("killed by user: swapped branch")),
+		stale: frameKeys({ ...synthetic, details: { taskId: "bg-x" } }),
+	}),
 );
 check(
 	"an entry written before the card existed still renders its text",

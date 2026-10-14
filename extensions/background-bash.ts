@@ -12,7 +12,7 @@ import {
   type ExtensionAPI,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -398,13 +398,15 @@ function stopSidebarTicker(): void {
 }
 
 // ── The card the user sees ───────────────────────────────────────────────────
-// pi hands a custom renderer's component straight to the transcript ("it handles its own
-// styling") and wraps it in nothing, so a bare Text(content) reads as raw text pasted into
-// the conversation — which is exactly how a multi-line notice looked. Build the shape the
-// built-in tool cards use instead: a title row, muted metadata, a body that collapses to a
-// preview behind the real "ctrl+o to expand" hint, and a muted footer. `details` carries the
-// pieces; `content` stays the model-facing text, and it remains the fallback for entries
-// written before this renderer existed, so replaying an old session still works.
+// pi hands a custom renderer's component straight to the transcript and wraps it in
+// nothing. It also skips its own customMessageBg box here: a registered renderer is taken
+// to handle its own styling, so the frame is this renderer's job, not pi's. Hence a Box
+// around the shape the built-in tool cards use: a title row, muted metadata, a body that
+// collapses to a preview behind the real "ctrl+o to expand" hint, and a muted footer. Its
+// colour follows the outcome by the tool cards' own rule — a failure gets toolErrorBg,
+// anything else toolSuccessBg — and a card with no outcome keeps customMessageBg. `details` carries the pieces; `content` stays the model-facing
+// text, and it remains the fallback for entries written before this renderer existed, so
+// replaying an old session still works.
 interface CompletionCardDetails {
   taskId: string;
   status?: string;
@@ -425,23 +427,33 @@ export default function (pi: ExtensionAPI) {
     "background-bash-completion",
     (message, options, theme) => {
       const d = message.details;
-      // No details: an entry from before this card existed. Render its text as it was.
-      if (!d?.status) return new Text(message.content, 0, 0);
-
       const pad = Math.max(0, options.outputPad ?? 1);
-      const indent = " ".repeat(pad);
+      // The frame lives here, not in pi — see the comment above. Padding comes from the
+      // Box, so nothing below indents by hand and every child renders at the inner width.
+      // `killed by user` is not a failure: the kill that did it reports success, and so
+      // does this card, which is why the test is the status text and not an exit code.
+      const status = d?.status;
+      const frameBg = !status
+        ? "customMessageBg"
+        : status.startsWith("failed")
+          ? "toolErrorBg"
+          : "toolSuccessBg";
+      const card = new Box(pad, 1, (line) => theme.bg(frameBg, line));
+      // No details: an entry from before this card existed. Render its text as it was.
+      if (!d?.status) {
+        card.addChild(new Text(message.content, 0, 0));
+        return card;
+      }
+
       const muted = (text: string): string => theme.fg("muted", text);
       // One row, cut to the width so a long command cannot wrap the card out of shape.
       const row = (text: string) => ({
-        render: (width: number) => [
-          `${indent}${truncateToWidth(text, Math.max(1, width - pad), "…")}`,
-        ],
+        render: (width: number) => [truncateToWidth(text, Math.max(1, width), "…")],
         invalidate: () => {},
       });
 
-      const card = new Container();
       card.addChild(
-        new Text(theme.fg("toolTitle", theme.bold(`⏵ ${d.taskId} · Status: ${d.status}`)), pad, 0),
+        new Text(theme.fg("toolTitle", theme.bold(`⏵ ${d.taskId} · Status: ${d.status}`)), 0, 0),
       );
       if (d.command) card.addChild(row(muted(`$ ${d.command}`)));
 
@@ -452,22 +464,17 @@ export default function (pi: ExtensionAPI) {
           .map((line) => theme.fg("toolOutput", line))
           .join("\n");
         if (options.expanded) {
-          card.addChild(new Text(styled, pad, 0));
+          card.addChild(new Text(styled, 0, 0));
         } else {
           card.addChild({
             render: (width: number) => {
-              const preview = truncateToVisualLines(
-                styled,
-                CARD_PREVIEW_LINES,
-                Math.max(1, width - pad),
-              );
-              const body = preview.visualLines.map((line) => `${indent}${line}`);
-              if (!preview.skippedCount) return body;
+              const preview = truncateToVisualLines(styled, CARD_PREVIEW_LINES, Math.max(1, width));
+              if (!preview.skippedCount) return preview.visualLines;
               const hint =
                 muted(`... (${preview.skippedCount} earlier lines,`) +
                 ` ${keyHint("app.tools.expand", "to expand")}` +
                 muted(")");
-              return [`${indent}${hint}`, ...body];
+              return [hint, ...preview.visualLines];
             },
             invalidate: () => {},
           });
@@ -476,7 +483,7 @@ export default function (pi: ExtensionAPI) {
 
       if (d.logPath) {
         const took = d.durationMs !== undefined ? ` · took ${formatDuration(d.durationMs)}` : "";
-        card.addChild(new Text(muted(`Log: ${d.logPath}${took}`), pad, 0));
+        card.addChild(new Text(muted(`Log: ${d.logPath}${took}`), 0, 0));
       }
       return card;
     },
