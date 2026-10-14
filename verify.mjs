@@ -175,14 +175,11 @@ try {
 	process.exit(1);
 }
 
-const guidance = (tools.get("bash").promptGuidelines ?? []).join("\n");
 check(
-	"the bash guidance stays compact and about the tool",
-	(tools.get("bash").promptGuidelines ?? []).length === 3 &&
-		/run_in_background=true/.test(guidance) &&
-		/until loop/.test(guidance) &&
-		/background_task/.test(guidance) &&
-		!/no[hu]up|setsid|disown/i.test(guidance),
+	"the bash tool carries no guidelines: the cards (6e) and the schema do the work",
+	(tools.get("bash").promptGuidelines ?? []).length === 0 &&
+		/run_in_background/.test(JSON.stringify(tools.get("bash").parameters)) &&
+		!/no[hu]up|setsid|disown/i.test(tools.get("bash").description),
 );
 
 // ── 3b. Python tooling routed through uv: unconditional, no setting ─────────
@@ -516,7 +513,7 @@ try {
 check(
 	"the output action is gone and an unknown action fails loudly",
 	outputGone &&
-		!/background_task output/.test((tools.get("background_task").promptGuidelines ?? []).join("\n")) &&
+		(tools.get("background_task").promptGuidelines ?? []).length === 0 &&
 		!/read output/.test(String(tools.get("background_task").description)),
 	JSON.stringify({ outputGone, guidelines: tools.get("background_task").promptGuidelines, description: tools.get("background_task").description }),
 );

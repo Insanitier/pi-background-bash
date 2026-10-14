@@ -677,11 +677,6 @@ export default function (pi: ExtensionAPI) {
     label: "bash",
     description: "Run a bash command. Long-running foreground commands auto-background after 120s and keep running.",
     promptSnippet: "Run shell commands (long-running ones auto-background after 120s)",
-    promptGuidelines: [
-      "Use run_in_background=true for commands expected to run long.",
-      "Never `sleep N` to wait for something — use background_task wait <id> or an until loop.",
-      "Use background_task to list or kill running tasks.",
-    ],
     parameters: bashParamSchema,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const p = params as { command: string; run_in_background?: boolean; description?: string };
@@ -721,12 +716,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "background_task",
     label: "background_task",
-    description: "List, stop, or wait for background tasks.",
+    description: "List, kill, or wait for background tasks.",
     promptSnippet: "Manage background tasks: list, kill, wait",
-    promptGuidelines: [
-      "Background tasks report their own outcome — never busy-poll with list or sleep. When the next step depends on the result, `wait <id> [seconds]` blocks for a while and returns status, a fresh tail and the log path; it never ends the task.",
-      "Every card carries a tail of the output plus its log path; read the log with bash for the rest.",
-    ],
     parameters: taskSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const ui = ctx.ui;
