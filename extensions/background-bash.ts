@@ -892,7 +892,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "background_task",
     label: "background_task",
-    description: "List, kill, or wait for background tasks.",
+    // The snippet names the three actions; a description that only reordered them said
+    // nothing the list had not, so it carries what the list cannot: what each one does.
+    description: "List, kill, or wait for background tasks. wait blocks for a while, then reports status, a fresh tail and the log path — the task keeps running; kill stops one and keeps its log.",
     promptSnippet: "Manage background tasks: list, kill, wait",
     parameters: taskSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
