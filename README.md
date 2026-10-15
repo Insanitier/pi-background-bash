@@ -62,7 +62,8 @@ The opposite case is what sets the limit. Where the next command depends on what
 Python tooling is routed through [uv](https://docs.astral.sh/uv/), absorbing the interception design from [mitsuhiko/agent-stuff's uv extension](https://github.com/mitsuhiko/agent-stuff). Like upstream it is unconditional: there is no setting and no env var.
 
 - `pip`, `pip3`, `poetry` and `python -m pip|venv|py_compile` are refused, with the uv equivalent in the error, explicit interpreter paths (`.venv/bin/python -m pip`) included, which a PATH shim alone cannot see.
-- `python` and `python3` run through `uv run` with the interpreter that was already first on `PATH`, so `sys.prefix` and `sys.executable` are unchanged. Without uv they fall back to that same interpreter, so a machine without uv keeps a working python (upstream exits 127 there).
+- `python` and `python3` run through `uv run` on the environment uv itself would have chosen — a project's `.venv`, an activated venv, `.python-version` — so `sys.prefix` and `sys.executable` are that environment's. Without uv they fall back to the interpreter that was already first on `PATH`, so a machine without uv keeps a working python (upstream exits 127 there).
+- Which interpreter that is stays uv's call, not the shim's: `--python` with whatever `python3` sat next to the shim did not merely pick an interpreter, it made uv rebuild the environment around that one and throw away what was installed in a project's `.venv`. The shim asks `uv python find` instead and hands that answer back — with the shim directory off `PATH` for that one call, because uv identifies an interpreter by running it and a probe that lands on the shim re-enters uv.
 - Blocking pip is the policy rather than a routing choice, so it stays blocked even without uv.
 - Nothing else is touched: the shim directory is only prepended to `PATH` inside the spawned shell.
 

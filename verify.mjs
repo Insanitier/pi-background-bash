@@ -41,6 +41,9 @@
  *      policy and the auto-background card included), a failed change skips the command, a
  *      failed command is an error that still carries the change and does not roll it back,
  *      and the card shows the command's output — which neither built-in renderer does alone
+ *  19. the uv shim runs a project on the project's own environment: a `.venv` built on a
+ *      different interpreter than the first `python3` on PATH is used as it is, never
+ *      rebuilt around that interpreter (which would throw the installed packages away)
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -259,6 +262,81 @@ check(
 			!fallbackText.includes("command not found") &&
 			/Use uv instead/.test(shimmedPip)),
 	JSON.stringify({ uvReachable, fallbackText, groundTruthText, shimmedPip: shimmedPip.trim() }),
+);
+
+// ── 3c. The environment uv picks is the environment the shim runs on ────────
+// Handing uv the interpreter that happens to sit next to the shim is not a routing
+// choice: inside a project uv rebuilds that project's .venv around the interpreter it is
+// handed, so a model running plain `python3` wipes what was installed in the environment.
+// The mismatch is the point, so the check needs a project environment built on a different
+// interpreter than the first python3 on PATH; with only one interpreter there is nothing to
+// see, and the check is skipped rather than reported as a pass it did not earn.
+const realPythons = (() => {
+	const seen = [];
+	try {
+		const listed = execFileSync("bash", ["-c", "type -aP python3; type -aP python"], { encoding: "utf-8" });
+		for (const line of listed.split("\n")) {
+			const candidate = line.trim();
+			if (!candidate) continue;
+			let resolved = "";
+			try {
+				resolved = execFileSync("readlink", ["-f", candidate], { encoding: "utf-8" }).trim();
+			} catch {
+				continue;
+			}
+			// This harness may itself run under a shell whose PATH carries the shim.
+			if (!resolved || resolved.startsWith(`${shimDir}/`) || seen.includes(resolved)) continue;
+			seen.push(resolved);
+		}
+	} catch {
+		/* no python3 on PATH at all */
+	}
+	return seen;
+})();
+const uvProject = join(WORK_DIR, "uv-project");
+const uvProjectVenv = join(uvProject, ".venv");
+const uvProjectCheckable = hasUv && realPythons.length > 1;
+let projectRunText = "";
+let projectVenvBefore = "";
+let projectVenvAfter = "";
+try {
+	if (uvProjectCheckable) {
+		mkdirSync(uvProject, { recursive: true });
+		writeFileSync(
+			join(uvProject, "pyproject.toml"),
+			'[project]\nname = "uv-project"\nversion = "0.0.0"\nrequires-python = ">=3.8"\n',
+		);
+		execFileSync("uv", ["venv", uvProjectVenv, "--python", realPythons[1], "-q"], { stdio: "pipe" });
+		// A package only this environment has: a rebuild starts from the manifest and loses it.
+		const sitePackages = execFileSync(
+			"bash",
+			["-c", `ls -d ${JSON.stringify(join(uvProjectVenv, "lib"))}/python*/site-packages`],
+			{ encoding: "utf-8" },
+		).trim();
+		mkdirSync(join(sitePackages, "verify_marker"), { recursive: true });
+		writeFileSync(join(sitePackages, "verify_marker", "__init__.py"), 'VALUE = "survived"\n');
+		projectVenvBefore = execFileSync("readlink", ["-f", join(uvProjectVenv, "bin", "python")], {
+			encoding: "utf-8",
+		}).trim();
+		const projectRun = await run("bash", {
+			command: `cd ${JSON.stringify(uvProject)} && python3 -c 'import sys, verify_marker; print("project:", sys.executable, verify_marker.VALUE)'`,
+		});
+		projectRunText = String(projectRun.content[0].text);
+		projectVenvAfter = execFileSync("readlink", ["-f", join(uvProjectVenv, "bin", "python")], {
+			encoding: "utf-8",
+		}).trim();
+	}
+} catch (error) {
+	projectRunText = `THREW: ${error?.message}`;
+}
+check(
+	"the shim runs a project on the project's own environment, without rebuilding it",
+	!uvProjectCheckable ||
+		(projectRunText.includes(`${uvProjectVenv}/bin/python`) &&
+			projectRunText.includes("survived") &&
+			projectVenvBefore === realPythons[1] &&
+			projectVenvAfter === projectVenvBefore),
+	JSON.stringify({ realPythons, projectVenvBefore, projectVenvAfter, projectRun: projectRunText.slice(0, 300) }),
 );
 
 // ── 4. Explicit background task: completion arrives as steer ────────────────

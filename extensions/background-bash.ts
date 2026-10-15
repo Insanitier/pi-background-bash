@@ -172,8 +172,19 @@ function shimScripts(): Record<string, string> {
     lines.map((line) => `echo "  ${line}" >&2\n`).join("") +
     "exit 1\n";
   const interpreter = (name: string): string => `#!/usr/bin/env bash
-# Run the real interpreter through uv, skipping this shim directory when resolving it.
+# Run this interpreter through uv, on the environment uv itself would have picked.
+#
+# Which Python a project runs on is uv's call — its own .venv, an activated venv, uv's
+# chosen interpreter — and --python does not merely pick an interpreter: uv rebuilds that
+# environment around the one it is handed, and whatever was installed in there is gone.
+# So the shim names an interpreter only when it can name the one uv would have named.
+#
+# uv identifies every python it finds on PATH by running it, so uv must never meet this
+# directory: the lookup below runs with it off PATH. The command itself keeps the PATH as
+# it is, so the shim still intercepts whatever that command spawns.
 shim_dir="$(cd "$(dirname "$0")" && pwd)"
+
+# The interpreter that was already first on PATH, this shim skipped: the last resort.
 real=""
 while IFS= read -r candidate; do
   [ -n "$candidate" ] || continue
@@ -181,13 +192,28 @@ while IFS= read -r candidate; do
   real="$candidate"
   break
 done < <(type -aP python3 2>/dev/null || type -aP python 2>/dev/null)
-# Redirect through uv; without uv, fall back to the interpreter so nothing gets worse.
+
 if command -v uv >/dev/null 2>&1; then
-  if [ -n "$real" ]; then
-    exec uv run --python "$real" python "$@"
+  # An activated environment is the environment: run in it, the way the activated python
+  # on PATH would, instead of rebuilding the project's environment around it.
+  if [ -n "\${VIRTUAL_ENV:-}" ] && { [ -x "$VIRTUAL_ENV/bin/python" ] || [ -x "$VIRTUAL_ENV/bin/python3" ]; }; then
+    exec uv run --active python "$@"
+  fi
+  # Otherwise let uv name the interpreter it would use — asked with this directory off
+  # PATH, so the question cannot come back here. Inside a project that is the project's
+  # own Python, so --python reuses its environment rather than recreating it.
+  clean_path=":$PATH:"
+  clean_path="\${clean_path//:$shim_dir:/:}"
+  clean_path="\${clean_path#:}"
+  clean_path="\${clean_path%:}"
+  target="$(PATH="$clean_path" uv python find 2>/dev/null || true)"
+  [ -n "$target" ] || target="$real"
+  if [ -n "$target" ]; then
+    exec uv run --python "$target" python "$@"
   fi
   exec uv run python "$@"
 fi
+# No uv: fall back to the interpreter that was already first on PATH.
 if [ -n "$real" ]; then
   exec "$real" "$@"
 fi
