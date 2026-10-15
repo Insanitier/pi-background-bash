@@ -36,6 +36,11 @@
  *  17. the completion notice renders as a card (Status title, command row, collapsed body
  *      behind the real expand hint, log footer), the status line carries its `Status: `
  *      prefix, and an entry written before the card existed still renders its text
+ *  18. `then_run` fuses a change with the command that follows it: the change lands first,
+ *      the command runs in the same call through the same foreground path as bash (uv
+ *      policy and the auto-background card included), a failed change skips the command, a
+ *      failed command is an error that still carries the change and does not roll it back,
+ *      and the card shows the command's output — which neither built-in renderer does alone
  *
  * Not covered here, because it cannot be triggered deterministically: a kill that
  * fails with something other than ESRCH must leave the watcher armed (see the
@@ -46,7 +51,7 @@
  * Run it with `node verify.mjs` (or `npm test`); it takes a few seconds.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -469,11 +474,44 @@ const failedTask = await run("bash", { command: "sleep 2.5; echo boom; exit 3", 
 const failedId = idOf(failedTask.content[0].text);
 const failedCard = failedId ? (await until(() => cardsFor(failedId).length > 0), cardsFor(failedId)[0]) : undefined;
 check(
-	"a failure card ends with the exit code and keeps the old, larger tail",
+	"a failure card ends with the exit code and keeps the larger failure budget",
 	failedId !== undefined &&
 		String(failedCard?.content).includes("boom") &&
 		String(failedCard?.content).split("\n").at(-1) === "Status: failed (exit 3)",
 	JSON.stringify({ id: failedId, card: failedCard?.content }),
+);
+
+// ── 6c-bis. Excerpt shape: head and tail, middle named, size bounded ───────
+// Far more output than any tier's budget, with a marker at each end so a head-only
+// or tail-only excerpt fails the check.
+const wide = (tag) =>
+	`sleep 2.5; echo HEAD-${tag}; for i in $(seq 1 4000); do echo "pad-$i-xxxxxxxxxxxxxxxxxxxxxxxx"; done; echo TAIL-${tag}`;
+
+const failedWide = await run("bash", { command: `${wide("FAIL")}; exit 3`, run_in_background: true });
+const failedWideId = idOf(failedWide.content[0].text);
+const failedWideCard = failedWideId
+	? (await until(() => cardsFor(failedWideId).length > 0), cardsFor(failedWideId)[0])
+	: undefined;
+check(
+	"a truncated failure excerpt keeps the first line and the last line, and names the omission",
+	failedWideId !== undefined &&
+		String(failedWideCard?.content).includes("HEAD-FAIL") &&
+		String(failedWideCard?.content).includes("TAIL-FAIL") &&
+		String(failedWideCard?.content).includes("…(middle omitted)"),
+	JSON.stringify({ id: failedWideId, card: String(failedWideCard?.content).slice(0, 300) }),
+);
+
+const okWide = await run("bash", { command: wide("OK"), run_in_background: true });
+const okWideId = idOf(okWide.content[0].text);
+const okWideCard = okWideId ? (await until(() => cardsFor(okWideId).length > 0), cardsFor(okWideId)[0]) : undefined;
+check(
+	"a success card gets the 1 KB head-and-tail excerpt, and drops the middle",
+	okWideId !== undefined &&
+		String(okWideCard?.content).includes("HEAD-OK") &&
+		String(okWideCard?.content).includes("TAIL-OK") &&
+		String(okWideCard?.content).includes("…(middle omitted)") &&
+		!String(okWideCard?.content).includes("pad-2000-"),
+	JSON.stringify({ id: okWideId, card: String(okWideCard?.content).slice(0, 300) }),
 );
 
 // ── 6d. Sanitized output: escapes never reach the model ────────────────────
@@ -702,6 +740,151 @@ check(
 		typeof notice.details.tail === "string" &&
 		notice.details.tail.length > 0,
 	JSON.stringify(notice?.details ?? null).slice(0, 300),
+);
+
+// ── 8b. then_run: a change and the command that follows it, in one turn ─────
+const editTool = tools.get("edit");
+const writeTool = tools.get("write");
+const propsOf = (tool) => Object.keys(tool?.parameters?.properties ?? {});
+const requiredOf = (tool) => tool?.parameters?.required ?? [];
+
+check(
+	"edit and write are re-registered as the built-in tools plus an optional then_run",
+	propsOf(editTool).join(",") === "path,edits,then_run" &&
+		propsOf(writeTool).join(",") === "path,content,then_run" &&
+		requiredOf(editTool).join(",") === "path,edits" &&
+		requiredOf(writeTool).join(",") === "path,content",
+	JSON.stringify({ edit: propsOf(editTool), write: propsOf(writeTool), editRequired: requiredOf(editTool) }),
+);
+
+const fusedPath = join(WORK_DIR, "fused.txt");
+writeFileSync(fusedPath, "before\n");
+const fused = await run("edit", {
+	path: fusedPath,
+	edits: [{ oldText: "before", newText: "after" }],
+	then_run: { command: `cat ${fusedPath}` },
+});
+const fusedText = fused.content.map((block) => block.text).join("\n");
+check(
+	"a change with then_run lands first, then runs the command, in one result",
+	// The command cats the file back, so reading "after" proves the change landed before
+	// the command started — the ordering the two-turn baseline got from the round trip.
+	fused.content.length === 2 &&
+		/^Successfully replaced/.test(fused.content[0].text) &&
+		fused.content[1].text.trim() === "after" &&
+		fused.details?.thenRun?.command === `cat ${fusedPath}`,
+	JSON.stringify({ content: fused.content, thenRun: fused.details?.thenRun }),
+);
+
+// A command that fails is an error, the same as it is for bash. The change is not rolled
+// back though, so the file still carries the edit and its confirmation leads the message.
+const failedCommand = await run("edit", {
+	path: fusedPath,
+	edits: [{ oldText: "after", newText: "after-2" }],
+	then_run: { command: "exit 3" },
+}).then(
+	() => undefined,
+	(error) => error.message,
+);
+check(
+	"a failing command is an error that still carries the change, and the change is not rolled back",
+	typeof failedCommand === "string" &&
+		/^Successfully replaced/.test(failedCommand) &&
+		/exited with code 3/.test(failedCommand) &&
+		readFileSync(fusedPath, "utf-8") === "after-2\n",
+	JSON.stringify({ message: failedCommand?.slice(0, 300), file: readFileSync(fusedPath, "utf-8") }),
+);
+
+const marker = join(WORK_DIR, "skipped-marker.txt");
+const failedChange = await run("edit", {
+	path: join(WORK_DIR, "no-such-file.txt"),
+	edits: [{ oldText: "a", newText: "b" }],
+	then_run: { command: `touch ${marker}` },
+}).then(
+	() => "resolved",
+	(error) => `threw: ${error.message}`,
+);
+check(
+	"a change that fails skips the command entirely",
+	failedChange.startsWith("threw:") && !existsSync(marker),
+	JSON.stringify({ failedChange: failedChange.slice(0, 160), markerExists: existsSync(marker) }),
+);
+
+const plain = await run("edit", { path: fusedPath, edits: [{ oldText: "after-2", newText: "plain" }] });
+check(
+	"an edit with no then_run is exactly the built-in result, diff and all",
+	plain.content.length === 1 &&
+		/^Successfully replaced/.test(plain.content[0].text) &&
+		typeof plain.details?.diff === "string" &&
+		plain.details?.thenRun === undefined,
+	JSON.stringify({ content: plain.content, details: Object.keys(plain.details ?? {}) }),
+);
+
+const blockedCommand = await run("edit", {
+	path: fusedPath,
+	edits: [{ oldText: "plain", newText: "plain-2" }],
+	then_run: { command: "pip install requests" },
+}).then(
+	() => undefined,
+	(error) => error.message,
+);
+check(
+	"a follow-up the uv policy refuses is an error that still carries the change",
+	typeof blockedCommand === "string" &&
+		/^Successfully replaced/.test(blockedCommand) &&
+		/uv/.test(blockedCommand) &&
+		readFileSync(fusedPath, "utf-8") === "plain-2\n",
+	JSON.stringify(blockedCommand?.slice(0, 300)),
+);
+
+const wroteFused = await run("write", {
+	path: join(WORK_DIR, "written.txt"),
+	content: "written-by-fuse\n",
+	then_run: { command: `cat ${join(WORK_DIR, "written.txt")}` },
+});
+const wroteText = wroteFused.content.map((block) => block.text).join("\n");
+check(
+	"write fuses the same way, keeping the built-in parameters and prompt text",
+	wroteText.includes("Successfully wrote to") && wroteText.includes("written-by-fuse"),
+	JSON.stringify(wroteText.slice(0, 300)),
+);
+
+// A follow-up that outruns the foreground window must end up on the same card any other
+// long command does: still running, with the three ways out. Otherwise a fused turn would
+// hand the model a handle it could not act on — a worse outcome than not fusing at all.
+const longFused = await run("edit", {
+	path: fusedPath,
+	edits: [{ oldText: "plain-2", newText: "plain-3" }],
+	then_run: { command: "sleep 5" },
+});
+const longText = longFused.content.map((block) => block.text).join("\n");
+check(
+	"a follow-up that outruns the foreground window auto-backgrounds with the three ways out",
+	longText.includes("Successfully replaced") &&
+		/auto-backgrounded after \d+s/.test(longText) &&
+		/background_task wait /.test(longText) &&
+		/background_task kill /.test(longText),
+	JSON.stringify(longText.slice(0, 400)),
+);
+
+// The card: edit renders only its diff and write renders only errors, so a fused call needs
+// the wrapper or the command's output reaches the model and never the person watching.
+const renderContext = { state: {}, args: {}, lastComponent: undefined, isError: false, outputPad: 0 };
+const themeStub = { fg: (_color, text) => text ?? "", bold: (text) => text ?? "" };
+const thenRunDetails = { thenRun: { command: "cat x.py", text: "the-command-output" } };
+const editCard = editTool.renderResult({ content: [], details: thenRunDetails }, {}, themeStub, renderContext);
+const editCardPlain = editTool.renderResult({ content: [], details: undefined }, {}, themeStub, renderContext);
+const writeCard = writeTool.renderResult({ content: [], details: thenRunDetails }, {}, themeStub, renderContext);
+check(
+	"the card shows the follow-up command and its output, and adds nothing when there was none",
+	editCard.render(100).join("\n").includes("the-command-output") &&
+		editCard.render(100).join("\n").includes("cat x.py") &&
+		writeCard.render(100).join("\n").includes("the-command-output") &&
+		editCardPlain.render(100).join("\n").trim() === "",
+	JSON.stringify({
+		edit: editCard.render(100).join("\n").slice(0, 200),
+		editPlain: editCardPlain.render(100).join("\n"),
+	}),
 );
 
 // ── 9. Cleanup ─────────────────────────────────────────────────────────────

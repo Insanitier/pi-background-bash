@@ -7,21 +7,28 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
+  createEditToolDefinition,
+  createWriteToolDefinition,
   keyHint,
   truncateToVisualLines,
   type ExtensionAPI,
+  type ExtensionContext,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Container, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const ROOT_DIR = join(tmpdir(), "pi-background-bash");
-// Failure cards keep the old, larger tail; every other card is deliberately small.
-const MAX_OUTPUT_BYTES = 32 * 1024;
-const MAX_OUTPUT_LINES = 200;
-const CARD_TAIL_CHARS = 2 * 1024;
-const CARD_TAIL_LINES = 20;
+// Every excerpt is the head and the tail of the log, split evenly, so a table's header
+// survives next to the error at the end. Failure cards carry evidence — a traceback or an
+// error block — so they get a larger budget than the other cards, which are pointers to a
+// log the model can read. The sizes come from real command output: an 8 KB failure excerpt
+// covers 97% of it whole, and the 32 KB it replaced only reached 99%.
+const MAX_OUTPUT_BYTES = 8 * 1024;
+const MAX_OUTPUT_LINES = 100;
+const CARD_EXCERPT_CHARS = 1024;
+const CARD_EXCERPT_LINES = 20;
 // How long `wait` may block before handing control back with a snapshot. The point is
 // that a wait must never be able to hide the model from a task for 40 minutes.
 const WAIT_DEFAULT_SECONDS = 30;
@@ -29,7 +36,11 @@ const WAIT_MAX_SECONDS = 60;
 // Overridable so the verify script can exercise the auto-background path.
 const AUTO_BG_TIMEOUT_MS = Number(process.env.BACKGROUND_BASH_AUTO_BG_MS ?? 120_000);
 const QUICK_COMPLETION_MS = 2_000;
-const FOREGROUND_TAIL_BYTES = 4_096;
+// The foreground return is the only view of a command that finished — its log is deleted
+// right after — so this tier is not a pointer and must not be sized like one. 4 KB is the
+// knee of the coverage curve: 91% of real command output fits whole, against 60% at 1 KB.
+const FOREGROUND_EXCERPT_BYTES = 4_096;
+const FOREGROUND_EXCERPT_LINES = 80;
 const PREVIEW_CHARS = 40;
 // Python tooling is routed through uv, the way mitsuhiko/agent-stuff's uv extension does
 // it: a PATH shim for anything the model types, plus a spawn-time check for explicit paths
@@ -216,25 +227,31 @@ async function ensureShims(): Promise<void> {
 }
 
 // ── Output reading ─────────────────────────────────────────────────────────
-function readTail(logPath: string, maxChars: number): string {
+/** One end of a log, read as bytes. It distinguishes "nothing to show" from "could not read
+ *  it", because an unreadable log must never be reported as an empty command. */
+type LogSlice = { readonly ok: true; readonly text: string } | { readonly ok: false; readonly reason: string };
+
+function errnoOf(error: unknown): string {
+  if (error instanceof Error && "code" in error && typeof error.code === "string") return error.code;
+  return error instanceof Error ? error.message : "unknown error";
+}
+
+function readEnd(logPath: string, from: "start" | "end", maxChars: number): LogSlice {
   let fd: number;
   try {
     fd = openSync(logPath, "r");
-  } catch {
-    return "(no output yet)";
+  } catch (error) {
+    return { ok: false, reason: errnoOf(error) };
   }
   try {
     const { size } = fstatSync(fd);
-    if (size === 0) return "(no output yet)";
+    if (size === 0) return { ok: true, text: "" };
     const toRead = Math.min(size, maxChars);
     const buf = Buffer.alloc(toRead);
-    readSync(fd, buf, 0, toRead, Math.max(0, size - toRead));
-    const body = buf.toString("utf-8");
-    return size > maxChars
-      ? `...[truncated, showing last ${maxChars} chars]\n${body}`
-      : body;
-  } catch {
-    return "(no output yet)";
+    readSync(fd, buf, 0, toRead, from === "end" ? Math.max(0, size - toRead) : 0);
+    return { ok: true, text: buf.toString("utf-8") };
+  } catch (error) {
+    return { ok: false, reason: errnoOf(error) };
   } finally {
     closeSync(fd);
   }
@@ -270,16 +287,47 @@ function sanitize(text: string): string {
   return out;
 }
 
-/** Last lines of a log, sanitized and bounded. Says so whenever it is not the whole story. */
-function tailLines(logPath: string, maxLines: number, maxChars: number): string {
-  const raw = readTail(logPath, maxChars * 3);
-  if (raw === "(no output yet)") return "";
-  const all = sanitize(raw).split("\n").filter((line) => line.trim() !== "");
-  const kept = all.slice(-maxLines);
-  const joined = kept.join("\n");
-  const body = joined.length > maxChars ? joined.slice(-maxChars) : joined;
-  const cut = raw.includes("...[truncated") || kept.length < all.length || body.length < joined.length;
-  return `${cut ? "…(earlier output omitted)\n" : ""}${body}`;
+/** Whole lines from one end of a chunk, stopping before the budget rather than cutting a
+ *  line in half. One over-long line is still kept, then clamped, rather than dropped. */
+function completeLines(text: string, maxLines: number, maxChars: number, fromEnd: boolean): string {
+  const lines = text.split("\n").filter((line) => line.trim() !== "");
+  const ordered = fromEnd ? [...lines].reverse() : lines;
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of ordered) {
+    const cost = Buffer.byteLength(line, "utf8") + (kept.length === 0 ? 0 : 1);
+    if (kept.length > 0 && (kept.length >= maxLines || used + cost > maxChars)) break;
+    kept.push(line);
+    used += cost;
+  }
+  const joined = (fromEnd ? kept.reverse() : kept).join("\n");
+  return Buffer.byteLength(joined, "utf8") <= maxChars
+    ? joined
+    : fromEnd ? joined.slice(-maxChars) : joined.slice(0, maxChars);
+}
+
+/** Head and tail of a log — sanitized, whole lines, bounded — so the top of the output and
+ *  the bottom of it both reach the model. Says so whenever it is not the whole story, and
+ *  says why when there is nothing to show at all. */
+function excerptLines(logPath: string, maxLines: number, maxChars: number): string {
+  const headChars = Math.ceil(maxChars / 2);
+  const tailChars = maxChars - headChars;
+  const headLines = Math.ceil(maxLines / 2);
+  const tailLines = maxLines - headLines;
+  // Over-read both windows so whole-line trimming still has lines left to drop.
+  const head = readEnd(logPath, "start", headChars * 2);
+  const tail = readEnd(logPath, "end", tailChars * 2);
+  if (!head.ok) return `…(excerpt unavailable: ${head.reason})`;
+  if (!tail.ok) return `…(excerpt unavailable: ${tail.reason})`;
+  if (head.text === "" && tail.text === "") return "";
+  const cleanHead = sanitize(head.text);
+  const cleanTail = sanitize(tail.text);
+  // Both windows saw the same bytes, so the log fits in one window: show it whole.
+  if (cleanHead === cleanTail) return completeLines(cleanHead, maxLines, maxChars, false);
+  const headText = completeLines(cleanHead, headLines, headChars, false);
+  const tailText = completeLines(cleanTail, tailLines, tailChars, true);
+  if (headText === "" || tailText === "") return headText || tailText;
+  return `${headText}\n…(middle omitted)\n${tailText}`;
 }
 
 // ── Formatting ──────────────────────────────────────────────────────────────
@@ -315,7 +363,7 @@ function runningHints(id: string): string {
 
 /** A task that just moved to the background: what it is, what it printed so far, how to leave it. */
 function backgroundCard(task: Task, logPath: string): string {
-  const tail = tailLines(logPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
+  const tail = excerptLines(logPath, CARD_EXCERPT_LINES, CARD_EXCERPT_CHARS);
   const seconds = Math.max(1, Math.round(AUTO_BG_TIMEOUT_MS / 1000));
   return [
     `⟳ "${shortCommand(task.command)}" (${task.id}) — auto-backgrounded after ${seconds}s; still running; full log: ${logPath}`,
@@ -510,8 +558,8 @@ export default function (pi: ExtensionAPI) {
     const exitCode = code ?? 1;
     const failed = exitCode !== 0;
     const status = failed ? `failed (exit ${exitCode})` : "completed";
-    const tail = tailLines(logPath, failed ? MAX_OUTPUT_LINES : CARD_TAIL_LINES,
-      failed ? MAX_OUTPUT_BYTES : CARD_TAIL_CHARS);
+    const tail = excerptLines(logPath, failed ? MAX_OUTPUT_LINES : CARD_EXCERPT_LINES,
+      failed ? MAX_OUTPUT_BYTES : CARD_EXCERPT_CHARS);
     // One duration for both the text and the card, so they cannot disagree.
     const shown = Date.now() - task.startedAt;
     const details: CompletionCardDetails = {
@@ -574,7 +622,9 @@ export default function (pi: ExtensionAPI) {
       stopListening();
       tasks.delete(id);
       renderSidebar(tasks, ui);
-      throw new Error(abortMessage(readTail(logPath, FOREGROUND_TAIL_BYTES), logPath));
+      throw new Error(
+        abortMessage(excerptLines(logPath, FOREGROUND_EXCERPT_LINES, FOREGROUND_EXCERPT_BYTES), logPath),
+      );
     };
 
     // Quick completion window (2s)
@@ -593,7 +643,7 @@ export default function (pi: ExtensionAPI) {
       stopListening();
       tasks.delete(id);
       renderSidebar(tasks, ui);
-      const output = readTail(logPath, FOREGROUND_TAIL_BYTES);
+      const output = excerptLines(logPath, FOREGROUND_EXCERPT_LINES, FOREGROUND_EXCERPT_BYTES);
       try { unlinkSync(logPath); } catch { /* ok */ }
       if (quickResult.code !== 0 && quickResult.code !== null) {
         throw new Error(output || `Command exited with code ${quickResult.code}`);
@@ -612,7 +662,7 @@ export default function (pi: ExtensionAPI) {
           closeSync(fd);
           if (size === lastPollSize) return;
           lastPollSize = size;
-          const tail = readTail(logPath, FOREGROUND_TAIL_BYTES);
+          const tail = excerptLines(logPath, FOREGROUND_EXCERPT_LINES, FOREGROUND_EXCERPT_BYTES);
           onUpdate?.({ content: [{ type: "text", text: tail }], details: undefined });
         } catch { /* file not ready */ }
       }, 1000);
@@ -638,7 +688,7 @@ export default function (pi: ExtensionAPI) {
       stopListening();
       tasks.delete(id);
       renderSidebar(tasks, ui);
-      const output = readTail(logPath, FOREGROUND_TAIL_BYTES);
+      const output = excerptLines(logPath, FOREGROUND_EXCERPT_LINES, FOREGROUND_EXCERPT_BYTES);
       try { unlinkSync(logPath); } catch { /* ok */ }
       if (raceResult.code !== 0 && raceResult.code !== null) {
         throw new Error(output || `Command exited with code ${raceResult.code}`);
@@ -719,6 +769,125 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── then_run: fuse a change and the command that follows it ────────────────
+  // "Change the file, then run it" costs two model turns: the change has to land before
+  // the command starts, and two tool calls cannot be ordered against each other. `then_run`
+  // collapses the pair — the change runs, and if it landed the command runs in the same
+  // call, both results in one observation. When the change fails the command is skipped,
+  // which needs no code of its own: the failure throws before the command is reached.
+  //
+  // The command goes through `runForeground`, the same path `bash` uses, so it keeps the uv
+  // shims, the 2s quick window, the streaming poll, and the 120s auto-background with its
+  // three-decision card. One way a command runs in this package, not two.
+  //
+  // A command that did not run, or did not succeed, is an error — the same as it is for
+  // `bash`. The change itself already landed and is not rolled back, so its confirmation
+  // rides in front of the reason rather than being replaced by it.
+  //
+  // There is no timeout parameter on purpose: the foreground semantics above already are
+  // this package's answer to "how long is too long", and a second, parallel timeout would be
+  // a rule to remember rather than a behaviour to rely on.
+  const thenRunSchema = Type.Optional(
+    Type.Object(
+      {
+        command: Type.String({
+          description:
+            "Command to run on this file once the change lands — run it, build it, start or restart it, install it, or check it. Skipped if the change itself fails; a non-zero exit is reported but the change is kept.",
+        }),
+      },
+      { description: "Run this command on the file once the change lands" },
+    ),
+  );
+
+  /** The command the model asked to run after the change, if it asked for one. */
+  const thenRunCommand = (input: unknown): string | undefined => {
+    const asked = (input as { then_run?: { command?: unknown } } | null)?.then_run?.command;
+    return typeof asked === "string" && asked.trim() ? asked.trim() : undefined;
+  };
+
+  /** Run it, and return what the model should read. Throws when the command did not run or
+   *  did not succeed: `runForeground` returns on completion and on auto-background, and
+   *  throws for everything else, so the two cases need no classifying here. */
+  const runThenRun = async (
+    command: string,
+    ctx: ExtensionContext,
+    signal: AbortSignal | undefined,
+    onUpdate: ((update: { content: { type: "text"; text: string }[]; details: undefined }) => void) | undefined,
+  ): Promise<string> => {
+    await ensureShims();
+    const blocked = uvBlockedMessage(command);
+    if (blocked) throw new Error(blocked);
+    const result = await runForeground(
+      command,
+      ctx.ui,
+      ctx.cwd,
+      logDir(ctx.sessionManager.getSessionId()),
+      signal,
+      onUpdate,
+    );
+    return result.content.map((block) => block.text).join("\n").trim() || "(no output)";
+  };
+
+  /** The built-in definitions capture their cwd in a closure, so keep one per directory
+   *  instead of rebuilding them on every call and every redraw. */
+  const memoizeByCwd = <T>(make: (cwd: string) => T): ((cwd: string) => T) => {
+    const cache = new Map<string, T>();
+    return (cwd) => {
+      const hit = cache.get(cwd);
+      if (hit) return hit;
+      const made = make(cwd);
+      cache.set(cwd, made);
+      return made;
+    };
+  };
+  const baseEdit = memoizeByCwd((cwd: string) => createEditToolDefinition(cwd));
+  const baseWrite = memoizeByCwd((cwd: string) => createWriteToolDefinition(cwd));
+
+  // edit and write, each with the optional follow-up command. Everything else — the schema,
+  // the prompt text, the argument shims, the renderers — is inherited from the built-in
+  // definitions, so this stays a superset of the tool the model already knew.
+  for (const base of [baseEdit, baseWrite]) {
+    const template = base(process.cwd());
+    const renderResult = template.renderResult;
+    pi.registerTool({
+      ...template,
+      parameters: Type.Object({
+        ...(template.parameters as unknown as { properties: Record<string, unknown> }).properties,
+        then_run: thenRunSchema,
+      }),
+      async execute(toolCallId, input, signal, onUpdate, ctx) {
+        const { then_run: _followUp, ...change } = input as Record<string, unknown>;
+        // The change first. When it throws the command is never reached, which is the
+        // "skipped if the change failed" rule.
+        const result = await base(ctx.cwd).execute(toolCallId, change, signal, onUpdate, ctx);
+        const command = thenRunCommand(input);
+        if (!command) return result;
+        try {
+          const text = await runThenRun(command, ctx, signal, onUpdate);
+          return {
+            content: [...result.content, { type: "text" as const, text }],
+            details: { ...(result.details as object | undefined), thenRun: { command, text } },
+          };
+        } catch (error) {
+          const changeText = result.content.map((block) => block.text).join("\n");
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error([changeText, reason].filter(Boolean).join("\n\n"));
+        }
+      },
+      renderResult(result, options, theme, context) {
+        const rendered = renderResult?.(result, options, theme, context);
+        const fused = (result.details as { thenRun?: { command: string; text: string } } | undefined)?.thenRun;
+        if (!rendered || !fused) return rendered;
+        // edit renders only its diff and write renders only errors, so without this the
+        // command's output would reach the model and never the person watching.
+        const container = new Container();
+        container.addChild(rendered);
+        container.addChild(new Text(`\n$ ${fused.command}\n${fused.text}`, 0, 0));
+        return container;
+      },
+    });
+  }
+
   // background_task — list / kill
   pi.registerTool({
     name: "background_task",
@@ -772,7 +941,7 @@ export default function (pi: ExtensionAPI) {
 
         const waited = formatDuration(Date.now() - (deadline - seconds * 1_000));
         const logPath = task.logPath;
-        const tail = tailLines(logPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
+        const tail = excerptLines(logPath, CARD_EXCERPT_LINES, CARD_EXCERPT_CHARS);
         const status = handedOver
           ? task.exitCode === 0 ? "completed" : `failed (exit ${task.exitCode ?? "?"})`
           : signal?.aborted
@@ -882,7 +1051,7 @@ export default function (pi: ExtensionAPI) {
           );
           if (reason === undefined) continue; // cancelled — abort kill
           const killedLogPath = task.logPath;
-          const killedTail = tailLines(killedLogPath, CARD_TAIL_LINES, CARD_TAIL_CHARS);
+          const killedTail = excerptLines(killedLogPath, CARD_EXCERPT_LINES, CARD_EXCERPT_CHARS);
           task.cancelled = true;
           try { process.kill(-task.pid, "SIGTERM"); } catch { /* best-effort */ }
           // The log stays: the card above names it, and a kill is exactly the case where
