@@ -35,28 +35,6 @@ Escape during a `wait` returns that wait cancelled and still leaves the completi
 
 A completion notice rides along with the current turn (`steer`) rather than ending it, and every background task reports its outcome however quickly it finished. Only a `wait` that actually saw the task end suppresses the card, because that wait's own result already carries the outcome. Work a command detaches by hand (`nohup`, `setsid`, a trailing `&`) is deliberately outside all of this: keep long work in the submitted shell's foreground, or let `run_in_background` detach the tool.
 
-## then_run (edit and write)
-
-`edit` and `write` take an optional `then_run`: a command to run on the file once the change lands.
-
-```
-edit { path, edits: [...], then_run: { command: "cd ~/projects/Soil_pe && uv run python plot.py" } }
-```
-
-The change runs first. If it lands, the command runs in the same tool call and both results come back as one observation — the two model turns the pair used to cost become one. If the change fails, the command is skipped, which needs no code of its own: the failure throws before the command is reached.
-
-A command that did not run, or did not succeed, produces an error — the same as it does for `bash`. The change itself is not rolled back: its confirmation leads the error message, so a failed check never hides that the change landed.
-
-The command goes through the same `runForeground` path `bash` uses, so it keeps the uv policy, the 2s quick window, the streaming poll, and the 120s auto-background with its three ways out. A follow-up that outruns the window ends on the same card any other long command does — a fused turn never hands back a handle the model cannot act on. There is no `timeout` parameter: the foreground semantics above already are this package's answer to "how long is too long", and a second, parallel timeout would be a rule to remember rather than a behaviour to rely on.
-
-Nothing else about the two tools changes: their schemas, prompt text, argument shims and renderers are inherited from the built-in definitions, so this stays a superset of the tool the model already knew. The one addition to the card is the command and its output on the last lines — `edit` renders only its diff and `write` renders only errors, so without that the output would reach the model and never the person watching.
-
-### Why it is here
-
-Measured over 333 sessions: in 46.6% of `edit`/`write` calls the next turn is `bash`, and in 68% of those the command runs or checks the file just changed — `edit plot.py`, then `cd … && uv run python plot.py`. Against all turns that is 3.4% all-time, 5.6% across the most recent 60 sessions, and 6–7% in the two largest analysis sessions. 61% of the changed files are `.py` and 23% `.ps1`: script iteration, where the next command is knowable in advance and the fusion is free.
-
-The opposite case is what sets the limit. Where the next command depends on what the previous one printed — exploratory work — fusing commits to it before that output exists. The measurement says that case is rare here; the mechanism cannot tell the two apart, so the schema is phrased to invite it only for a command that follows from the change itself.
-
 ## uv mode (always on)
 
 Python tooling is routed through [uv](https://docs.astral.sh/uv/), absorbing the interception design from [mitsuhiko/agent-stuff's uv extension](https://github.com/mitsuhiko/agent-stuff). Like upstream it is unconditional: there is no setting and no env var.
@@ -67,4 +45,4 @@ Python tooling is routed through [uv](https://docs.astral.sh/uv/), absorbing the
 - Blocking pip is the policy rather than a routing choice, so it stays blocked even without uv.
 - Nothing else is touched: the shim directory is only prepended to `PATH` inside the spawned shell.
 
-`npm test` runs the regression net (`verify.mjs`): module load, the background guidance, the card shape and ordering, sanitized tails, the completion rules above, deliberate stops, the widget clearing, and every `then_run` rule.
+`npm test` runs the regression net (`verify.mjs`): module load, the background guidance, the card shape and ordering, sanitized tails, the completion rules above, deliberate stops, and the widget clearing.

@@ -7,15 +7,13 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  createEditToolDefinition,
-  createWriteToolDefinition,
   keyHint,
   truncateToVisualLines,
   type ExtensionAPI,
   type ExtensionContext,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -794,125 +792,6 @@ export default function (pi: ExtensionAPI) {
       return runForeground(p.command, ui, ctx.cwd, logDir(ctx.sessionManager.getSessionId()), signal, onUpdate);
     },
   });
-
-  // ── then_run: fuse a change and the command that follows it ────────────────
-  // "Change the file, then run it" costs two model turns: the change has to land before
-  // the command starts, and two tool calls cannot be ordered against each other. `then_run`
-  // collapses the pair — the change runs, and if it landed the command runs in the same
-  // call, both results in one observation. When the change fails the command is skipped,
-  // which needs no code of its own: the failure throws before the command is reached.
-  //
-  // The command goes through `runForeground`, the same path `bash` uses, so it keeps the uv
-  // shims, the 2s quick window, the streaming poll, and the 120s auto-background with its
-  // three-decision card. One way a command runs in this package, not two.
-  //
-  // A command that did not run, or did not succeed, is an error — the same as it is for
-  // `bash`. The change itself already landed and is not rolled back, so its confirmation
-  // rides in front of the reason rather than being replaced by it.
-  //
-  // There is no timeout parameter on purpose: the foreground semantics above already are
-  // this package's answer to "how long is too long", and a second, parallel timeout would be
-  // a rule to remember rather than a behaviour to rely on.
-  const thenRunSchema = Type.Optional(
-    Type.Object(
-      {
-        command: Type.String({
-          description:
-            "Command to run on this file once the change lands — run it, build it, start or restart it, install it, or check it. Skipped if the change itself fails; a non-zero exit is reported but the change is kept.",
-        }),
-      },
-      { description: "Run this command on the file once the change lands" },
-    ),
-  );
-
-  /** The command the model asked to run after the change, if it asked for one. */
-  const thenRunCommand = (input: unknown): string | undefined => {
-    const asked = (input as { then_run?: { command?: unknown } } | null)?.then_run?.command;
-    return typeof asked === "string" && asked.trim() ? asked.trim() : undefined;
-  };
-
-  /** Run it, and return what the model should read. Throws when the command did not run or
-   *  did not succeed: `runForeground` returns on completion and on auto-background, and
-   *  throws for everything else, so the two cases need no classifying here. */
-  const runThenRun = async (
-    command: string,
-    ctx: ExtensionContext,
-    signal: AbortSignal | undefined,
-    onUpdate: ((update: { content: { type: "text"; text: string }[]; details: undefined }) => void) | undefined,
-  ): Promise<string> => {
-    await ensureShims();
-    const blocked = uvBlockedMessage(command);
-    if (blocked) throw new Error(blocked);
-    const result = await runForeground(
-      command,
-      ctx.ui,
-      ctx.cwd,
-      logDir(ctx.sessionManager.getSessionId()),
-      signal,
-      onUpdate,
-    );
-    return result.content.map((block) => block.text).join("\n").trim() || "(no output)";
-  };
-
-  /** The built-in definitions capture their cwd in a closure, so keep one per directory
-   *  instead of rebuilding them on every call and every redraw. */
-  const memoizeByCwd = <T>(make: (cwd: string) => T): ((cwd: string) => T) => {
-    const cache = new Map<string, T>();
-    return (cwd) => {
-      const hit = cache.get(cwd);
-      if (hit) return hit;
-      const made = make(cwd);
-      cache.set(cwd, made);
-      return made;
-    };
-  };
-  const baseEdit = memoizeByCwd((cwd: string) => createEditToolDefinition(cwd));
-  const baseWrite = memoizeByCwd((cwd: string) => createWriteToolDefinition(cwd));
-
-  // edit and write, each with the optional follow-up command. Everything else — the schema,
-  // the prompt text, the argument shims, the renderers — is inherited from the built-in
-  // definitions, so this stays a superset of the tool the model already knew.
-  for (const base of [baseEdit, baseWrite]) {
-    const template = base(process.cwd());
-    const renderResult = template.renderResult;
-    pi.registerTool({
-      ...template,
-      parameters: Type.Object({
-        ...(template.parameters as unknown as { properties: Record<string, unknown> }).properties,
-        then_run: thenRunSchema,
-      }),
-      async execute(toolCallId, input, signal, onUpdate, ctx) {
-        const { then_run: _followUp, ...change } = input as Record<string, unknown>;
-        // The change first. When it throws the command is never reached, which is the
-        // "skipped if the change failed" rule.
-        const result = await base(ctx.cwd).execute(toolCallId, change, signal, onUpdate, ctx);
-        const command = thenRunCommand(input);
-        if (!command) return result;
-        try {
-          const text = await runThenRun(command, ctx, signal, onUpdate);
-          return {
-            content: [...result.content, { type: "text" as const, text }],
-            details: { ...(result.details as object | undefined), thenRun: { command, text } },
-          };
-        } catch (error) {
-          const changeText = result.content.map((block) => block.text).join("\n");
-          const reason = error instanceof Error ? error.message : String(error);
-          throw new Error([changeText, reason].filter(Boolean).join("\n\n"));
-        }
-      },
-      renderResult(result, options, theme, context) {
-        const rendered = renderResult?.(result, options, theme, context);
-        const fused = (result.details as { thenRun?: { command: string; text: string } } | undefined)?.thenRun;
-        if (!rendered || !fused) return rendered;
-        // edit renders only its diff and write renders only errors, so without this the
-        // command's output would reach the model and never the person watching.
-        const container = new Container();
-        container.addChild(rendered);
-        container.addChild(new Text(`\n$ ${fused.command}\n${fused.text}`, 0, 0));
-        return container;
-      },
-    });
-  }
 
   // background_task — list / kill
   pi.registerTool({
